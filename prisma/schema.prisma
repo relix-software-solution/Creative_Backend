@@ -1,0 +1,1135 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+enum EventStatus {
+  DRAFT
+  SCHEDULED
+  ACTIVE
+  COMPLETED
+  CANCELLED
+  ARCHIVED
+}
+
+enum EventType {
+  EXHIBITION
+  CONFERENCE
+  WORKSHOP
+  SUMMIT
+  FESTIVAL
+  CAREER_FAIR
+  OTHER
+}
+
+enum CheckpointType {
+  ENTRY
+  EXIT
+  BOOTH
+  SESSION_ROOM
+  VIP_AREA
+  INTERNAL_POINT
+  WORKSHOP_AREA
+  OTHER
+}
+
+enum RegistrationFieldType {
+  TEXT
+  TEXTAREA
+  NUMBER
+  EMAIL
+  PHONE
+  DATE
+  BOOLEAN
+  SELECT
+  MULTI_SELECT
+  FILE
+}
+
+enum RegistrationStatus {
+  PENDING
+  ACTIVE
+  CANCELLED
+  BLOCKED
+  ARCHIVED
+}
+
+enum RegistrationSource {
+  ONLINE
+  ONSITE
+  EXCEL_IMPORT
+  OFFLINE_DEVICE
+  ADMIN
+  PUBLIC
+}
+
+enum QrTokenStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+enum ScanEventStatus {
+  PENDING
+  PROCESSED
+  DUPLICATE
+  FAILED
+  INVALID_QR
+}
+
+enum MovementType {
+  ENTRY
+  EXIT
+  CHECKPOINT
+  BOOTH_VISIT
+  SESSION_ATTENDANCE
+  VIP_ACCESS
+}
+
+enum MovementResult {
+  ALLOWED
+  DENIED
+  WARNING
+}
+
+enum SyncBatchStatus {
+  RECEIVED
+  PROCESSING
+  COMPLETED
+  PARTIAL_FAILED
+  FAILED
+  DUPLICATE
+}
+
+enum SyncOperationType {
+  OFFLINE_REGISTRATION
+  OFFLINE_SCAN
+  QR_GENERATION
+  SCAN_EVENT
+}
+
+enum SyncOperationStatus {
+  PENDING
+  PROCESSED
+  FAILED
+  DUPLICATE
+  SKIPPED
+}
+
+enum ImportJobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  PARTIAL_FAILED
+  FAILED
+  CANCELLED
+}
+
+enum ImportRowStatus {
+  PENDING
+  PROCESSED
+  FAILED
+  DUPLICATE
+  SKIPPED
+}
+
+enum NotificationChannel {
+  WHATSAPP
+  EMAIL
+  SMS
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  DELIVERED
+  FAILED
+  CANCELLED
+}
+
+enum NotificationProvider {
+  FAKE
+  WASENDER
+  META_CLOUD
+}
+
+enum NotificationTemplateType {
+  REGISTRATION_QR
+  IMPORT_QR
+  GENERIC
+}
+
+enum DeviceStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+enum OfflineKeyStatus {
+  ACTIVE
+  REVOKED
+  ROTATED
+}
+
+enum OfflineRegistrationMappingStatus {
+  PENDING
+  SYNCED
+  MATCHED_EXISTING
+  CONFLICTED
+  REVOKED
+}
+
+enum OfflineScanOperationStatus {
+  PENDING_LINK
+  LINKED
+  PROCESSED
+  CONFLICTED
+  FAILED
+}
+
+enum Locale {
+  AR
+  EN
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  IMPORT
+  EXPORT
+  SCAN
+  SYNC
+  SEND_NOTIFICATION
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  CLIENT_VIEWER
+  STAFF
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  INVITED
+  DELETED
+}
+
+enum StaffSessionStatus {
+  ACTIVE
+  ENDED
+  EXPIRED
+}
+
+enum StaffScanMode {
+  ENTRY
+  EXIT
+  CHECKPOINT
+  BOOTH_VISIT
+  SESSION_ATTENDANCE
+  VIP_ACCESS
+}
+
+model Client {
+  id           String   @id @default(cuid())
+  name         String
+  contactName  String?
+  contactPhone String?
+  contactEmail String?
+  notes        String?  @db.Text
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  events Event[]
+  users  User[]
+
+  @@index([name])
+  @@index([isActive])
+}
+
+model User {
+  id           String     @id @default(cuid())
+  clientId     String?
+  email        String?    @unique
+  phone        String?    @unique
+  passwordHash String
+  fullName     String
+  role         UserRole
+  status       UserStatus @default(ACTIVE)
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  deletedAt    DateTime?
+
+  client           Client?           @relation(fields: [clientId], references: [id])
+  createdAuditLogs AuditLog[]
+  refreshTokens    RefreshToken[]
+  staffAssignments StaffAssignment[]
+  staffSessions    StaffSession[]
+  importJobs       ImportJob[]
+
+  @@index([clientId])
+  @@index([role])
+  @@index([status])
+  @@index([createdAt])
+  @@index([deletedAt])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  revokedAt DateTime?
+  expiresAt DateTime
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+model Event {
+  id                String      @id @default(cuid())
+  clientId          String
+  type              EventType   @default(EXHIBITION)
+  status            EventStatus @default(DRAFT)
+  titleAr           String
+  titleEn           String?
+  descriptionAr     String?     @db.Text
+  descriptionEn     String?     @db.Text
+  startsAt          DateTime
+  endsAt            DateTime
+  timezone          String      @default("Asia/Damascus")
+  allowReEntry      Boolean     @default(true)
+  duplicateStrategy String      @default("PHONE")
+  qrValidFrom       DateTime?
+  qrValidUntil      DateTime?
+  isActive          Boolean     @default(true)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  client                      Client                       @relation(fields: [clientId], references: [id])
+  venues                      Venue[]
+  zones                       Zone[]
+  checkpoints                 Checkpoint[]
+  devices                     Device[]
+  attendeeTypes               AttendeeType[]
+  registrationFields          RegistrationField[]
+  staffAssignments            StaffAssignment[]
+  staffSessions               StaffSession[]
+  registrations               Registration[]
+  qrTokens                    QrToken[]
+  scanEventsRaw               ScanEventRaw[]
+  movementLogs                MovementLog[]
+  syncBatches                 SyncBatch[]
+  offlineRegistrationMappings OfflineRegistrationMapping[]
+  offlineScanOperations       OfflineScanOperation[]
+  importJobs                  ImportJob[]
+  notificationTemplates       NotificationTemplate[]
+  notificationLogs            NotificationLog[]
+  branding                    EventBranding?
+  badgeTemplate               EventBadgeTemplate?
+  digitalTicketTemplates      DigitalTicketTemplate[]
+  digitalTicketImages         DigitalTicketImage[]
+
+  @@index([clientId])
+  @@index([status])
+  @@index([type])
+  @@index([startsAt])
+  @@index([endsAt])
+  @@index([isActive])
+}
+
+model EventBranding {
+  id                  String   @id @default(cuid())
+  eventId             String   @unique
+  logoUrl             String?
+  backgroundImageUrl  String?
+  certificateImageUrl String?
+  theme               Json
+  isActive            Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  event Event @relation(fields: [eventId], references: [id])
+
+  @@index([isActive])
+  @@index([createdAt])
+}
+
+model EventBadgeTemplate {
+  id                 String   @id @default(cuid())
+  eventId            String   @unique
+  name               String
+  widthMm            Int
+  heightMm           Int
+  backgroundImageUrl String?
+  colors             Json
+  layout             Json
+  selectedFields     Json
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  event Event @relation(fields: [eventId], references: [id])
+
+  @@index([isActive])
+  @@index([createdAt])
+}
+
+model DigitalTicketTemplate {
+  id                   String   @id @default(cuid())
+  eventId              String
+  attendeeTypeId       String?
+  attendeeTypeScopeKey String   @default("__EVENT__")
+  name                 String
+  widthPx              Int
+  heightPx             Int
+  backgroundImageUrl   String?
+  backgroundImagePath  String?
+  theme                Json
+  elements             Json
+  selectedFields       Json
+  version              Int      @default(1)
+  isActive             Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  event        Event                @relation(fields: [eventId], references: [id])
+  attendeeType AttendeeType?        @relation(fields: [attendeeTypeId], references: [id])
+  images       DigitalTicketImage[]
+
+  @@unique([eventId, attendeeTypeScopeKey])
+  @@index([eventId])
+  @@index([attendeeTypeId])
+  @@index([isActive])
+  @@index([createdAt])
+}
+
+model DigitalTicketImage {
+  id              String   @id @default(cuid())
+  eventId         String
+  registrationId  String
+  templateId      String
+  imageUrl        String
+  relativePath    String
+  templateVersion Int
+  generatedAt     DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  event        Event                 @relation(fields: [eventId], references: [id])
+  registration Registration          @relation(fields: [registrationId], references: [id])
+  template     DigitalTicketTemplate @relation(fields: [templateId], references: [id])
+
+  @@unique([registrationId, templateId, templateVersion])
+  @@index([eventId])
+  @@index([registrationId])
+  @@index([templateId])
+  @@index([generatedAt])
+}
+
+model StaffAssignment {
+  id           String   @id @default(cuid())
+  eventId      String
+  userId       String
+  checkpointId String?
+  deviceId     String?
+  isActive     Boolean  @default(true)
+  notes        String?  @db.Text
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  event      Event       @relation(fields: [eventId], references: [id])
+  user       User        @relation(fields: [userId], references: [id])
+  checkpoint Checkpoint? @relation(fields: [checkpointId], references: [id])
+  device     Device?     @relation(fields: [deviceId], references: [id])
+
+  @@unique([eventId, userId])
+  @@index([eventId])
+  @@index([userId])
+  @@index([checkpointId])
+  @@index([deviceId])
+  @@index([isActive])
+}
+
+model StaffSession {
+  id           String             @id @default(cuid())
+  eventId      String
+  staffUserId  String
+  deviceId     String
+  checkpointId String
+  mode         StaffScanMode
+  status       StaffSessionStatus @default(ACTIVE)
+  startedAt    DateTime           @default(now())
+  endedAt      DateTime?
+  lastSeenAt   DateTime?
+  metadata     Json?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  event                 Event                  @relation(fields: [eventId], references: [id])
+  staffUser             User                   @relation(fields: [staffUserId], references: [id])
+  device                Device                 @relation(fields: [deviceId], references: [id])
+  checkpoint            Checkpoint             @relation(fields: [checkpointId], references: [id])
+  scanEventsRaw         ScanEventRaw[]
+  movementLogs          MovementLog[]
+  syncBatches           SyncBatch[]
+  offlineScanOperations OfflineScanOperation[]
+
+  @@index([eventId])
+  @@index([staffUserId])
+  @@index([deviceId])
+  @@index([checkpointId])
+  @@index([status])
+  @@index([startedAt])
+  @@index([lastSeenAt])
+}
+
+model SyncBatch {
+  id              String          @id @default(cuid())
+  batchId         String          @unique
+  eventId         String
+  deviceId        String
+  staffSessionId  String?
+  status          SyncBatchStatus @default(RECEIVED)
+  totalOperations Int             @default(0)
+  processedCount  Int             @default(0)
+  failedCount     Int             @default(0)
+  duplicateCount  Int             @default(0)
+  receivedAt      DateTime        @default(now())
+  processedAt     DateTime?
+  payload         Json?
+  result          Json?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  event        Event           @relation(fields: [eventId], references: [id])
+  device       Device          @relation(fields: [deviceId], references: [id])
+  staffSession StaffSession?   @relation(fields: [staffSessionId], references: [id])
+  operations   SyncOperation[]
+  checkpoint   Checkpoint?     @relation(fields: [checkpointId], references: [id])
+  checkpointId String?
+
+  @@index([eventId])
+  @@index([deviceId])
+  @@index([staffSessionId])
+  @@index([status])
+  @@index([receivedAt])
+  @@index([processedAt])
+}
+
+model SyncOperation {
+  id           String              @id @default(cuid())
+  syncBatchId  String
+  operationId  String              @unique
+  type         SyncOperationType
+  status       SyncOperationStatus @default(PENDING)
+  input        Json
+  output       Json?
+  errorCode    String?
+  errorMessage String?             @db.Text
+  processedAt  DateTime?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  syncBatch SyncBatch @relation(fields: [syncBatchId], references: [id])
+
+  @@index([syncBatchId])
+  @@index([operationId])
+  @@index([type])
+  @@index([status])
+  @@index([processedAt])
+}
+
+model AttendeeType {
+  id            String   @id @default(cuid())
+  eventId       String
+  code          String
+  nameAr        String
+  nameEn        String?
+  descriptionAr String?  @db.Text
+  descriptionEn String?  @db.Text
+  isDefault     Boolean  @default(false)
+  isActive      Boolean  @default(true)
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  event                  Event                   @relation(fields: [eventId], references: [id])
+  registrationFields     RegistrationField[]
+  registrations          Registration[]
+  importJobs             ImportJob[]
+  digitalTicketTemplates DigitalTicketTemplate[]
+
+  @@unique([eventId, code])
+  @@index([eventId])
+  @@index([code])
+  @@index([isActive])
+  @@index([sortOrder])
+}
+
+model RegistrationField {
+  id             String                @id @default(cuid())
+  eventId        String
+  attendeeTypeId String?
+  key            String
+  labelAr        String
+  labelEn        String?
+  type           RegistrationFieldType
+  placeholderAr  String?
+  placeholderEn  String?
+  helpTextAr     String?               @db.Text
+  helpTextEn     String?               @db.Text
+  isRequired     Boolean               @default(false)
+  isUnique       Boolean               @default(false)
+  options        Json?
+  validation     Json?
+  sortOrder      Int                   @default(0)
+  isActive       Boolean               @default(true)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  event        Event         @relation(fields: [eventId], references: [id])
+  attendeeType AttendeeType? @relation(fields: [attendeeTypeId], references: [id])
+
+  @@unique([eventId, key, attendeeTypeId])
+  @@index([eventId])
+  @@index([attendeeTypeId])
+  @@index([key])
+  @@index([type])
+  @@index([isRequired])
+  @@index([isActive])
+  @@index([sortOrder])
+}
+
+model Registration {
+  id             String             @id @default(cuid())
+  publicId       String             @unique
+  eventId        String
+  attendeeTypeId String
+  status         RegistrationStatus @default(ACTIVE)
+  source         RegistrationSource @default(ADMIN)
+  fullName       String
+  phone          String?
+  email          String?
+  companyName    String?
+  jobTitle       String?
+  externalId     String?
+  customFields   Json?
+  notes          String?            @db.Text
+  ticketRequestToken     String?    @unique
+  ticketRequestExpiresAt DateTime?
+  ticketRequestCreatedAt DateTime?
+  ticketRequestConsumedAt DateTime?
+  registeredAt   DateTime           @default(now())
+  syncedAt       DateTime?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  event                       Event                        @relation(fields: [eventId], references: [id])
+  attendeeType                AttendeeType                 @relation(fields: [attendeeTypeId], references: [id])
+  qrToken                     QrToken?
+  scanEventsRaw               ScanEventRaw[]
+  movementLogs                MovementLog[]
+  importRows                  ImportRow[]
+  notificationLogs            NotificationLog[]
+  offlineRegistrationMappings OfflineRegistrationMapping[]
+  offlineScanOperations       OfflineScanOperation[]
+  digitalTicketImages         DigitalTicketImage[]
+
+  @@unique([eventId, phone])
+  @@unique([eventId, email])
+  @@unique([eventId, externalId])
+  @@index([eventId])
+  @@index([attendeeTypeId])
+  @@index([status])
+  @@index([source])
+  @@index([phone])
+  @@index([email])
+  @@index([externalId])
+  @@index([ticketRequestToken])
+  @@index([ticketRequestExpiresAt])
+  @@index([registeredAt])
+  @@index([createdAt])
+}
+
+model WebhookDelivery {
+  id          String    @id @default(cuid())
+  provider    String
+  deliveryId  String    @unique
+  status      String
+  reason      String?
+  payload     Json?
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([provider])
+  @@index([status])
+  @@index([receivedAt])
+}
+
+model ImportJob {
+  id               String          @id @default(cuid())
+  eventId          String
+  attendeeTypeId   String?
+  uploadedByUserId String?
+  fileName         String
+  fileMimeType     String?
+  fileSizeBytes    Int?
+  status           ImportJobStatus @default(PENDING)
+  totalRows        Int             @default(0)
+  processedRows    Int             @default(0)
+  successRows      Int             @default(0)
+  failedRows       Int             @default(0)
+  duplicateRows    Int             @default(0)
+  options          Json?
+  summary          Json?
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  event          Event         @relation(fields: [eventId], references: [id])
+  attendeeType   AttendeeType? @relation(fields: [attendeeTypeId], references: [id])
+  uploadedByUser User?         @relation(fields: [uploadedByUserId], references: [id])
+  rows           ImportRow[]
+
+  @@index([eventId])
+  @@index([attendeeTypeId])
+  @@index([uploadedByUserId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([completedAt])
+}
+
+model ImportRow {
+  id             String          @id @default(cuid())
+  importJobId    String
+  rowNumber      Int
+  status         ImportRowStatus @default(PENDING)
+  rawData        Json
+  normalizedData Json?
+  registrationId String?
+  errorCode      String?
+  errorMessage   String?         @db.Text
+  processedAt    DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  importJob    ImportJob     @relation(fields: [importJobId], references: [id])
+  registration Registration? @relation(fields: [registrationId], references: [id])
+
+  @@unique([importJobId, rowNumber])
+  @@index([importJobId])
+  @@index([status])
+  @@index([registrationId])
+  @@index([rowNumber])
+  @@index([processedAt])
+}
+
+model NotificationTemplate {
+  id        String                   @id @default(cuid())
+  eventId   String?
+  type      NotificationTemplateType
+  channel   NotificationChannel
+  locale    Locale                   @default(AR)
+  name      String
+  content   String                   @db.Text
+  isActive  Boolean                  @default(true)
+  createdAt DateTime                 @default(now())
+  updatedAt DateTime                 @updatedAt
+
+  event Event?            @relation(fields: [eventId], references: [id])
+  logs  NotificationLog[]
+
+  @@unique([eventId, type, channel, locale])
+  @@index([eventId])
+  @@index([type])
+  @@index([channel])
+  @@index([locale])
+  @@index([isActive])
+}
+
+model NotificationLog {
+  id                String                    @id @default(cuid())
+  eventId           String?
+  registrationId    String?
+  templateId        String?
+  notificationType  NotificationTemplateType?
+  dedupeKey         String?                   @unique
+  channel           NotificationChannel
+  provider          NotificationProvider
+  recipient         String
+  status            NotificationStatus        @default(PENDING)
+  subject           String?
+  content           String                    @db.Text
+  providerMessageId String?
+  errorCode         String?
+  errorMessage      String?                   @db.Text
+  metadata          Json?
+  sentAt            DateTime?
+  deliveredAt       DateTime?
+  failedAt          DateTime?
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+
+  event        Event?                @relation(fields: [eventId], references: [id])
+  registration Registration?         @relation(fields: [registrationId], references: [id])
+  template     NotificationTemplate? @relation(fields: [templateId], references: [id])
+
+  @@index([eventId])
+  @@index([registrationId])
+  @@index([templateId])
+  @@index([notificationType])
+  @@index([channel])
+  @@index([provider])
+  @@index([recipient])
+  @@index([status])
+  @@index([createdAt])
+  @@index([sentAt])
+}
+
+model QrToken {
+  id             String        @id @default(cuid())
+  registrationId String        @unique
+  eventId        String
+  tokenId        String        @unique
+  payload        Json
+  signature      String
+  status         QrTokenStatus @default(ACTIVE)
+  validFrom      DateTime
+  validUntil     DateTime
+  generatedAt    DateTime      @default(now())
+  revokedAt      DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  registration                Registration                 @relation(fields: [registrationId], references: [id])
+  event                       Event                        @relation(fields: [eventId], references: [id])
+  scanEventsRaw               ScanEventRaw[]
+  movementLogs                MovementLog[]
+  offlineRegistrationMappings OfflineRegistrationMapping[]
+
+  @@index([eventId])
+  @@index([tokenId])
+  @@index([status])
+  @@index([validFrom])
+  @@index([validUntil])
+  @@index([generatedAt])
+}
+
+model ScanEventRaw {
+  id               String          @id @default(cuid())
+  operationId      String          @unique
+  eventId          String
+  deviceId         String
+  staffSessionId   String?
+  checkpointId     String?
+  registrationId   String?
+  qrTokenId        String?
+  qrPayload        Json?
+  qrRaw            String?         @db.Text
+  type             MovementType
+  status           ScanEventStatus @default(PENDING)
+  result           MovementResult?
+  reason           String?
+  scannedAtDevice  DateTime
+  receivedAtServer DateTime        @default(now())
+  processedAt      DateTime?
+  payload          Json?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  event                Event                 @relation(fields: [eventId], references: [id])
+  device               Device                @relation(fields: [deviceId], references: [id])
+  staffSession         StaffSession?         @relation(fields: [staffSessionId], references: [id])
+  checkpoint           Checkpoint?           @relation(fields: [checkpointId], references: [id])
+  registration         Registration?         @relation(fields: [registrationId], references: [id])
+  qrToken              QrToken?              @relation(fields: [qrTokenId], references: [id])
+  movementLog          MovementLog?
+  offlineScanOperation OfflineScanOperation?
+
+  @@index([eventId])
+  @@index([deviceId])
+  @@index([staffSessionId])
+  @@index([checkpointId])
+  @@index([registrationId])
+  @@index([qrTokenId])
+  @@index([status])
+  @@index([type])
+  @@index([scannedAtDevice])
+  @@index([receivedAtServer])
+  @@index([processedAt])
+}
+
+model MovementLog {
+  id             String         @id @default(cuid())
+  eventId        String
+  registrationId String
+  qrTokenId      String?
+  scanEventRawId String         @unique
+  deviceId       String
+  staffSessionId String?
+  checkpointId   String?
+  type           MovementType
+  result         MovementResult
+  reason         String?
+  occurredAt     DateTime
+  createdAt      DateTime       @default(now())
+
+  event                 Event                  @relation(fields: [eventId], references: [id])
+  registration          Registration           @relation(fields: [registrationId], references: [id])
+  qrToken               QrToken?               @relation(fields: [qrTokenId], references: [id])
+  scanEventRaw          ScanEventRaw           @relation(fields: [scanEventRawId], references: [id])
+  device                Device                 @relation(fields: [deviceId], references: [id])
+  staffSession          StaffSession?          @relation(fields: [staffSessionId], references: [id])
+  checkpoint            Checkpoint?            @relation(fields: [checkpointId], references: [id])
+  offlineScanOperations OfflineScanOperation[]
+
+  @@index([eventId])
+  @@index([registrationId])
+  @@index([qrTokenId])
+  @@index([deviceId])
+  @@index([staffSessionId])
+  @@index([checkpointId])
+  @@index([type])
+  @@index([result])
+  @@index([occurredAt])
+}
+
+model Venue {
+  id        String   @id @default(cuid())
+  eventId   String
+  nameAr    String
+  nameEn    String?
+  addressAr String?  @db.Text
+  addressEn String?  @db.Text
+  city      String?
+  country   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  event       Event        @relation(fields: [eventId], references: [id])
+  zones       Zone[]
+  checkpoints Checkpoint[]
+
+  @@index([eventId])
+  @@index([city])
+  @@index([country])
+}
+
+model Zone {
+  id        String   @id @default(cuid())
+  eventId   String
+  venueId   String?
+  parentId  String?
+  nameAr    String
+  nameEn    String?
+  code      String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  event       Event        @relation(fields: [eventId], references: [id])
+  venue       Venue?       @relation(fields: [venueId], references: [id])
+  parent      Zone?        @relation("ZoneHierarchy", fields: [parentId], references: [id])
+  children    Zone[]       @relation("ZoneHierarchy")
+  checkpoints Checkpoint[]
+
+  @@unique([eventId, code])
+  @@index([eventId])
+  @@index([venueId])
+  @@index([parentId])
+  @@index([code])
+  @@index([sortOrder])
+}
+
+model Checkpoint {
+  id                   String         @id @default(cuid())
+  eventId              String
+  venueId              String?
+  zoneId               String?
+  type                 CheckpointType
+  nameAr               String
+  nameEn               String?
+  code                 String
+  allowedAttendeeTypes Json?
+  isActive             Boolean        @default(true)
+  sortOrder            Int            @default(0)
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  event                 Event                  @relation(fields: [eventId], references: [id])
+  venue                 Venue?                 @relation(fields: [venueId], references: [id])
+  zone                  Zone?                  @relation(fields: [zoneId], references: [id])
+  staffSessions         StaffSession[]
+  staffAssignments      StaffAssignment[]
+  scanEventsRaw         ScanEventRaw[]
+  movementLogs          MovementLog[]
+  syncBatches           SyncBatch[]
+  offlineScanOperations OfflineScanOperation[]
+
+  @@unique([eventId, code])
+  @@index([eventId])
+  @@index([venueId])
+  @@index([zoneId])
+  @@index([type])
+  @@index([isActive])
+  @@index([code])
+}
+
+model Device {
+  id         String       @id @default(cuid())
+  eventId    String
+  name       String
+  code       String       @unique
+  apiKeyHash String       @unique
+  status     DeviceStatus @default(PENDING)
+  lastSeenAt DateTime?
+  metadata   Json?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  event                             Event                        @relation(fields: [eventId], references: [id])
+  staffAssignments                  StaffAssignment[]
+  staffSessions                     StaffSession[]
+  scanEventsRaw                     ScanEventRaw[]
+  movementLogs                      MovementLog[]
+  syncBatches                       SyncBatch[]
+  offlineKeys                       DeviceOfflineKey[]
+  issuedOfflineRegistrationMappings OfflineRegistrationMapping[] @relation("OfflineRegistrationIssuer")
+  scannedOfflineOperations          OfflineScanOperation[]       @relation("OfflineScanScanner")
+
+  @@index([eventId])
+  @@index([status])
+  @@index([lastSeenAt])
+}
+
+model DeviceOfflineKey {
+  id         String           @id @default(cuid())
+  deviceId   String
+  version    Int
+  publicKey  String           @db.Text
+  status     OfflineKeyStatus @default(ACTIVE)
+  validFrom  DateTime         @default(now())
+  validUntil DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@unique([deviceId, version])
+  @@index([deviceId])
+  @@index([status])
+  @@index([validFrom])
+  @@index([validUntil])
+}
+
+model OfflineRegistrationMapping {
+  id                             String                           @id @default(cuid())
+  eventId                        String
+  issuerDeviceId                 String
+  offlineRegistrationOperationId String
+  offlineRegistrationId          String
+  offlineQrToken                 String                           @unique
+  issuerKeyVersion               Int
+  payloadHash                    String
+  registrationId                 String?
+  canonicalQrTokenId             String?
+  status                         OfflineRegistrationMappingStatus @default(PENDING)
+  conflictCode                   String?
+  conflictMessage                String?                          @db.Text
+  syncedAt                       DateTime?
+  createdAt                      DateTime                         @default(now())
+  updatedAt                      DateTime                         @updatedAt
+
+  event            Event         @relation(fields: [eventId], references: [id])
+  issuerDevice     Device        @relation("OfflineRegistrationIssuer", fields: [issuerDeviceId], references: [id])
+  registration     Registration? @relation(fields: [registrationId], references: [id])
+  canonicalQrToken QrToken?      @relation(fields: [canonicalQrTokenId], references: [id])
+
+  @@unique([issuerDeviceId, eventId, offlineRegistrationOperationId], map: "OfflineRegMapping_issuer_op_key")
+  @@unique([issuerDeviceId, eventId, offlineRegistrationId], map: "OfflineRegMapping_issuer_local_key")
+  @@index([registrationId])
+  @@index([eventId])
+  @@index([offlineQrToken])
+  @@index([status])
+}
+
+model OfflineScanOperation {
+  id                             String                     @id @default(cuid())
+  operationId                    String                     @unique
+  eventId                        String
+  scannerDeviceId                String
+  checkpointId                   String
+  staffSessionId                 String?
+  offlineQrToken                 String
+  offlineRegistrationOperationId String?
+  issuerDeviceId                 String?
+  issuerKeyVersion               Int?
+  scannedAtDevice                DateTime
+  movementType                   MovementType
+  localResult                    String?
+  qrPayload                      Json?
+  qrPayloadHash                  String?
+  status                         OfflineScanOperationStatus @default(PENDING_LINK)
+  registrationId                 String?
+  movementId                     String?                    @unique
+  scanEventRawId                 String?                    @unique
+  conflictCode                   String?
+  conflictMessage                String?                    @db.Text
+  syncedAt                       DateTime?
+  createdAt                      DateTime                   @default(now())
+  updatedAt                      DateTime                   @updatedAt
+
+  event         Event         @relation(fields: [eventId], references: [id])
+  scannerDevice Device        @relation("OfflineScanScanner", fields: [scannerDeviceId], references: [id])
+  checkpoint    Checkpoint    @relation(fields: [checkpointId], references: [id])
+  staffSession  StaffSession? @relation(fields: [staffSessionId], references: [id])
+  registration  Registration? @relation(fields: [registrationId], references: [id])
+  movement      MovementLog?  @relation(fields: [movementId], references: [id])
+  scanEventRaw  ScanEventRaw? @relation(fields: [scanEventRawId], references: [id])
+
+  @@index([eventId])
+  @@index([offlineQrToken])
+  @@index([registrationId])
+  @@index([scannerDeviceId])
+  @@index([status])
+  @@index([scannedAtDevice])
+}
+
+model AuditLog {
+  id          String      @id @default(cuid())
+  eventId     String?
+  actorUserId String?
+  action      AuditAction
+  entityType  String
+  entityId    String?
+  ipAddress   String?
+  userAgent   String?     @db.Text
+  metadata    Json?
+  createdAt   DateTime    @default(now())
+
+  actorUser User? @relation(fields: [actorUserId], references: [id])
+
+  @@index([eventId])
+  @@index([actorUserId])
+  @@index([action])
+  @@index([entityType])
+  @@index([entityId])
+  @@index([createdAt])
+}
