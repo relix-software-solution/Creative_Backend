@@ -632,6 +632,8 @@ model Registration {
   ticketRequestExpiresAt DateTime?
   ticketRequestCreatedAt DateTime?
   ticketRequestConsumedAt DateTime?
+  ticketRequestPhone       String?
+  ticketRequestClaimedAt   DateTime? 
   registeredAt   DateTime           @default(now())
   syncedAt       DateTime?
   createdAt      DateTime           @default(now())
@@ -662,6 +664,7 @@ model Registration {
   @@index([ticketRequestExpiresAt])
   @@index([registeredAt])
   @@index([createdAt])
+  @@index([ticketRequestPhone])
 }
 
 model WebhookDelivery {

@@ -28,10 +28,27 @@ type IncomingMessage = {
   group: boolean;
 };
 
+type ClaimTicketRequestSenderInput = {
+  registrationId: string;
+  senderPhone: string;
+  ticketRequestToken: string;
+};
+
 @Injectable()
 export class WhatsappTicketRequestsService {
+  /**
+   * مثال:
+   * REG_237DA5E4E4DC3E43
+   */
   private readonly publicIdPattern =
     /(?:^|[^A-Z0-9_-])(REG_[A-Z0-9_-]{1,60})(?![A-Z0-9_-])/i;
+
+  /**
+   * مثال:
+   * WTR_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   */
+  private readonly ticketRequestTokenPattern =
+    /(?:^|[^A-Za-z0-9_-])(WTR_[A-Za-z0-9_-]{20,100})(?![A-Za-z0-9_-])/;
 
   constructor(
     private readonly configService: ConfigService,
@@ -40,39 +57,62 @@ export class WhatsappTicketRequestsService {
     private readonly prisma: PrismaService,
   ) {}
 
+  /**
+   * ينشئ رابط WhatsApp جديدًا للتسجيل.
+   *
+   * كل مرة يتم إنشاء رابط جديد:
+   * - يتم إنشاء رمز طلب جديد.
+   * - تنتهي صلاحية الرمز القديم.
+   * - يتم إلغاء ربط أي حساب WhatsApp سابق.
+   * - يصبح أول حساب يرسل الرمز الجديد هو الحساب المعتمد.
+   */
   async createForRegistration(registrationId: string) {
     const registration = await this.prisma.registration.findUnique({
-      where: { id: registrationId },
-      select: { publicId: true },
+      where: {
+        id: registrationId,
+      },
+      select: {
+        id: true,
+        publicId: true,
+      },
     });
 
     if (!registration) {
       throw new NotFoundException('Registration not found');
     }
 
-    const expiresAt = new Date(
-      Date.now() +
-        this.configService.get<number>(
-          'WHATSAPP_TICKET_REQUEST_EXPIRES_HOURS',
-          24,
-        ) *
-          60 *
-          60 *
-          1000,
+    const expiresHours = this.configService.get<number>(
+      'WHATSAPP_TICKET_REQUEST_EXPIRES_HOURS',
+      24,
     );
+
+    const expiresAt = new Date(Date.now() + expiresHours * 60 * 60 * 1000);
+
     const ticketRequestToken = await this.persistUniqueToken(
-      registrationId,
+      registration.id,
       expiresAt,
     );
 
     return {
       enabled: true,
       ticketRequestToken,
-      url: this.buildWhatsAppUrl(registration.publicId),
+      url: this.buildWhatsAppUrl(registration.publicId, ticketRequestToken),
       expiresAt: expiresAt.toISOString(),
     };
   }
 
+  /**
+   * يستقبل Webhook الرسائل الواردة من Wasender.
+   *
+   * آلية الأمان:
+   * 1. التحقق من Webhook Secret.
+   * 2. استخراج رقم التسجيل.
+   * 3. استخراج رمز الطلب السري.
+   * 4. التحقق من صلاحية الرمز.
+   * 5. ربط أول حساب WhatsApp يرسل الطلب بالتسجيل.
+   * 6. السماح لنفس الحساب بإعادة الطلب.
+   * 7. رفض أي حساب آخر يحاول استخدام الرسالة نفسها.
+   */
   async handleWasenderWebhook(
     headers: Record<string, string | string[] | undefined>,
     payload: Record<string, unknown>,
@@ -80,35 +120,73 @@ export class WhatsappTicketRequestsService {
     this.validateWebhookSecret(headers);
 
     const message = this.extractIncomingMessage(payload);
+
     const delivery = await this.recordDelivery(message.deliveryId, payload);
 
     if (delivery.duplicate) {
-      return { ignored: true, reason: 'DUPLICATE_WEBHOOK_DELIVERY' };
+      return {
+        ignored: true,
+        reason: 'DUPLICATE_WEBHOOK_DELIVERY',
+      };
     }
 
     if (message.eventType !== 'messages.received') {
       await this.markDelivery(delivery.id, 'IGNORED', 'UNSUPPORTED_EVENT');
-      return { ignored: true, reason: 'UNSUPPORTED_EVENT' };
+
+      return {
+        ignored: true,
+        reason: 'UNSUPPORTED_EVENT',
+      };
     }
 
     if (message.outgoing) {
       await this.markDelivery(delivery.id, 'IGNORED', 'OUTGOING_MESSAGE');
-      return { ignored: true, reason: 'OUTGOING_MESSAGE' };
+
+      return {
+        ignored: true,
+        reason: 'OUTGOING_MESSAGE',
+      };
     }
 
     if (message.group) {
       await this.markDelivery(delivery.id, 'IGNORED', 'GROUP_MESSAGE');
-      return { ignored: true, reason: 'GROUP_MESSAGE' };
+
+      return {
+        ignored: true,
+        reason: 'GROUP_MESSAGE',
+      };
     }
 
     const publicId = this.extractPublicId(message.text);
+
     if (!publicId) {
       await this.markDelivery(delivery.id, 'REJECTED', 'PUBLIC_ID_NOT_FOUND');
-      return { ignored: true, reason: 'PUBLIC_ID_NOT_FOUND' };
+
+      return {
+        ignored: true,
+        reason: 'PUBLIC_ID_NOT_FOUND',
+      };
+    }
+
+    const ticketRequestToken = this.extractTicketRequestToken(message.text);
+
+    if (!ticketRequestToken) {
+      await this.markDelivery(
+        delivery.id,
+        'REJECTED',
+        'TICKET_REQUEST_TOKEN_NOT_FOUND',
+      );
+
+      return {
+        ignored: true,
+        reason: 'TICKET_REQUEST_TOKEN_NOT_FOUND',
+      };
     }
 
     const registration = await this.prisma.registration.findUnique({
-      where: { publicId },
+      where: {
+        publicId,
+      },
     });
 
     if (!registration) {
@@ -117,30 +195,105 @@ export class WhatsappTicketRequestsService {
         'REJECTED',
         'REGISTRATION_NOT_FOUND',
       );
-      return { ignored: true, reason: 'REGISTRATION_NOT_FOUND' };
+
+      return {
+        ignored: true,
+        reason: 'REGISTRATION_NOT_FOUND',
+      };
     }
 
     if (registration.status !== RegistrationStatus.ACTIVE) {
       await this.markDelivery(delivery.id, 'REJECTED', 'REGISTRATION_INACTIVE');
-      return { ignored: true, reason: 'REGISTRATION_INACTIVE' };
+
+      return {
+        ignored: true,
+        reason: 'REGISTRATION_INACTIVE',
+      };
     }
 
-    if (!registration.phone) {
+    /**
+     * نتحقق من أن الرمز الموجود داخل الرسالة
+     * هو الرمز الحالي الخاص بالتسجيل.
+     */
+    if (
+      !registration.ticketRequestToken ||
+      !this.safeSecretEquals(
+        ticketRequestToken,
+        registration.ticketRequestToken,
+      )
+    ) {
       await this.markDelivery(
         delivery.id,
         'REJECTED',
-        'REGISTRATION_PHONE_MISSING',
+        'INVALID_TICKET_REQUEST_TOKEN',
       );
-      return { ignored: true, reason: 'REGISTRATION_PHONE_MISSING' };
+
+      return {
+        ignored: true,
+        reason: 'INVALID_TICKET_REQUEST_TOKEN',
+      };
     }
 
-    const senderPhone = this.normalizePhone(message.senderPhone);
+    /**
+     * التحقق من صلاحية رابط الطلب.
+     */
     if (
-      !senderPhone ||
-      senderPhone !== this.normalizePhone(registration.phone)
+      !registration.ticketRequestExpiresAt ||
+      registration.ticketRequestExpiresAt.getTime() <= Date.now()
     ) {
-      await this.markDelivery(delivery.id, 'REJECTED', 'PHONE_MISMATCH');
-      return { ignored: true, reason: 'PHONE_MISMATCH' };
+      await this.markDelivery(
+        delivery.id,
+        'REJECTED',
+        'TICKET_REQUEST_EXPIRED',
+      );
+
+      return {
+        ignored: true,
+        reason: 'TICKET_REQUEST_EXPIRED',
+      };
+    }
+
+    /**
+     * الرقم الذي أرسل رسالة WhatsApp فعليًا.
+     *
+     * لم نعد نقارنه مع الرقم الذي أدخله المستخدم
+     * في نموذج التسجيل.
+     */
+    const senderPhone = this.normalizePhone(message.senderPhone);
+
+    if (!senderPhone) {
+      await this.markDelivery(delivery.id, 'REJECTED', 'SENDER_PHONE_MISSING');
+
+      return {
+        ignored: true,
+        reason: 'SENDER_PHONE_MISSING',
+      };
+    }
+
+    /**
+     * أول حساب WhatsApp يرسل الطلب يصبح الحساب المعتمد.
+     *
+     * إذا كان الطلب مربوطًا مسبقًا:
+     * - نفس الرقم: مسموح.
+     * - رقم مختلف: مرفوض.
+     */
+    const senderClaimed = await this.claimTicketRequestSender({
+      registrationId: registration.id,
+      senderPhone,
+      ticketRequestToken,
+    });
+
+    if (!senderClaimed) {
+      await this.markDelivery(
+        delivery.id,
+        'REJECTED',
+        'TICKET_REQUEST_ALREADY_BOUND',
+      );
+
+      return {
+        ignored: true,
+        reason: 'TICKET_REQUEST_ALREADY_BOUND',
+      };
     }
 
     let image: Awaited<
@@ -156,32 +309,73 @@ export class WhatsappTicketRequestsService {
         error instanceof NotFoundException
           ? 'DIGITAL_TICKET_TEMPLATE_NOT_FOUND'
           : 'DIGITAL_TICKET_UNAVAILABLE';
+
       await this.markDelivery(delivery.id, 'REJECTED', reason);
-      return { ignored: true, reason };
+
+      return {
+        ignored: true,
+        reason,
+      };
     }
 
     const imageUrl = this.resolvePublicHttpsImageUrl(
       image.imageUrl,
       image.relativePath,
     );
+
     if (!imageUrl) {
       await this.markDelivery(
         delivery.id,
         'REJECTED',
         'PUBLIC_IMAGE_URL_UNAVAILABLE',
       );
-      return { ignored: true, reason: 'PUBLIC_IMAGE_URL_UNAVAILABLE' };
+
+      return {
+        ignored: true,
+        reason: 'PUBLIC_IMAGE_URL_UNAVAILABLE',
+      };
     }
 
-    const notification =
-      await this.notificationsService.sendRegistrationTicketImage({
-        registrationId: registration.id,
-        imageUrl,
-        recipient: senderPhone,
-        dedupeKey: `DIGITAL_TICKET_REQUEST:${registration.id}:${message.deliveryId}`,
-        locale: Locale.AR,
-        forceResend: false,
-      });
+    let notification: Awaited<
+      ReturnType<NotificationsService['sendRegistrationTicketImage']>
+    >;
+
+    try {
+      notification =
+        await this.notificationsService.sendRegistrationTicketImage({
+          registrationId: registration.id,
+          imageUrl,
+          recipient: senderPhone,
+          dedupeKey: `DIGITAL_TICKET_REQUEST:${registration.id}:${message.deliveryId}`,
+          locale: Locale.AR,
+          forceResend: false,
+        });
+    } catch (error) {
+      await this.markDelivery(
+        delivery.id,
+        'REJECTED',
+        'NOTIFICATION_QUEUE_FAILED',
+      );
+
+      throw error;
+    }
+
+    /**
+     * نسجل أن الطلب استُخدم بنجاح.
+     *
+     * لا نحذف الرمز ولا نمنع نفس رقم WhatsApp
+     * من إعادة الطلب، فقد يحتاج إلى المحاولة مجددًا.
+     */
+    await this.prisma.registration.updateMany({
+      where: {
+        id: registration.id,
+        ticketRequestToken,
+        ticketRequestConsumedAt: null,
+      },
+      data: {
+        ticketRequestConsumedAt: new Date(),
+      },
+    });
 
     await this.markDelivery(delivery.id, 'PROCESSED', undefined);
 
@@ -200,18 +394,29 @@ export class WhatsappTicketRequestsService {
     };
   }
 
+  /**
+   * ينشئ رمز طلب جديدًا ويحفظه على التسجيل.
+   *
+   * يتم تصفير رقم WhatsApp المرتبط لأن الرمز الجديد
+   * يمثل عملية طلب جديدة.
+   */
   private async persistUniqueToken(registrationId: string, expiresAt: Date) {
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      const ticketRequestToken = randomBytes(32).toString('base64url');
+      const ticketRequestToken = `WTR_${randomBytes(24).toString('base64url')}`;
 
       try {
-        await (this.prisma.registration as any).update({
-          where: { id: registrationId },
+        await this.prisma.registration.update({
+          where: {
+            id: registrationId,
+          },
           data: {
             ticketRequestToken,
             ticketRequestExpiresAt: expiresAt,
             ticketRequestCreatedAt: new Date(),
             ticketRequestConsumedAt: null,
+
+            ticketRequestPhone: null,
+            ticketRequestClaimedAt: null,
           },
         });
 
@@ -231,14 +436,149 @@ export class WhatsappTicketRequestsService {
     throw new BadRequestException('Could not generate ticket request token');
   }
 
-  private buildWhatsAppUrl(publicId: string) {
+  /**
+   * يربط أول حساب WhatsApp بالطلب.
+   *
+   * الربط يتم باستخدام updateMany مشروط لمنع حالتي
+   * وصول رسالتين من رقمين مختلفين في اللحظة نفسها.
+   */
+  private async claimTicketRequestSender(input: ClaimTicketRequestSenderInput) {
+    const now = new Date();
+
+    const currentRegistration = await this.prisma.registration.findUnique({
+      where: {
+        id: input.registrationId,
+      },
+      select: {
+        ticketRequestToken: true,
+        ticketRequestExpiresAt: true,
+        ticketRequestPhone: true,
+      },
+    });
+
+    if (!currentRegistration) {
+      return false;
+    }
+
+    if (
+      !currentRegistration.ticketRequestToken ||
+      !this.safeSecretEquals(
+        input.ticketRequestToken,
+        currentRegistration.ticketRequestToken,
+      )
+    ) {
+      return false;
+    }
+
+    if (
+      !currentRegistration.ticketRequestExpiresAt ||
+      currentRegistration.ticketRequestExpiresAt.getTime() <= now.getTime()
+    ) {
+      return false;
+    }
+
+    /**
+     * الطلب مربوط مسبقًا.
+     *
+     * نسمح فقط إذا كان المرسل الحالي هو نفس
+     * حساب WhatsApp المرتبط.
+     */
+    if (currentRegistration.ticketRequestPhone) {
+      return (
+        this.normalizePhone(currentRegistration.ticketRequestPhone) ===
+        input.senderPhone
+      );
+    }
+
+    /**
+     * محاولة ربط الطلب لأول مرة.
+     *
+     * الشرط ticketRequestPhone: null يمنع رقمين
+     * من حجز الطلب في الوقت نفسه.
+     */
+    const claimed = await this.prisma.registration.updateMany({
+      where: {
+        id: input.registrationId,
+        ticketRequestToken: input.ticketRequestToken,
+        ticketRequestExpiresAt: {
+          gt: now,
+        },
+        ticketRequestPhone: null,
+      },
+      data: {
+        ticketRequestPhone: input.senderPhone,
+        ticketRequestClaimedAt: now,
+      },
+    });
+
+    if (claimed.count === 1) {
+      return true;
+    }
+
+    /**
+     * ربما تم تنفيذ طلبين متزامنين.
+     * نقرأ النتيجة النهائية ونتأكد من الرقم الذي تم ربطه.
+     */
+    const latestRegistration = await this.prisma.registration.findUnique({
+      where: {
+        id: input.registrationId,
+      },
+      select: {
+        ticketRequestToken: true,
+        ticketRequestExpiresAt: true,
+        ticketRequestPhone: true,
+      },
+    });
+
+    if (
+      !latestRegistration?.ticketRequestPhone ||
+      !latestRegistration.ticketRequestToken ||
+      !latestRegistration.ticketRequestExpiresAt
+    ) {
+      return false;
+    }
+
+    if (latestRegistration.ticketRequestExpiresAt.getTime() <= Date.now()) {
+      return false;
+    }
+
+    if (
+      !this.safeSecretEquals(
+        input.ticketRequestToken,
+        latestRegistration.ticketRequestToken,
+      )
+    ) {
+      return false;
+    }
+
+    return (
+      this.normalizePhone(latestRegistration.ticketRequestPhone) ===
+      input.senderPhone
+    );
+  }
+
+  /**
+   * الرسالة الجاهزة التي يرسلها الزائر.
+   *
+   * يجب أن يأتي الرابط من الباك كما هو.
+   * لا يجب على الفرونت إعادة بناء الرسالة.
+   */
+  private buildWhatsAppUrl(publicId: string, ticketRequestToken: string) {
     const requestPhone = this.normalizePhone(
       this.configService.get<string>('WHATSAPP_REQUEST_PHONE', ''),
     );
-    const message = `\u0637\u0644\u0628 \u0628\u0637\u0627\u0642\u0629 \u0627\u0644\u062f\u062e\u0648\u0644\n${publicId}`;
-    const recipientPath = requestPhone ? `/${requestPhone}` : '';
 
-    return `https://wa.me${recipientPath}?text=${encodeURIComponent(message)}`;
+    if (!requestPhone) {
+      throw new BadRequestException('WHATSAPP_REQUEST_PHONE is not configured');
+    }
+
+    const message = [
+      'طلب بطاقة الدخول',
+      `رقم التسجيل: ${publicId}`,
+      `رمز الطلب: ${ticketRequestToken}`,
+    ].join('\n');
+
+    return `https://wa.me/${requestPhone}?text=${encodeURIComponent(message)}`;
   }
 
   private validateWebhookSecret(
@@ -253,13 +593,10 @@ export class WhatsappTicketRequestsService {
     }
 
     /**
-     * Fastify يحول أسماء الـ Headers إلى lowercase.
+     * Fastify يحول أسماء Headers إلى lowercase.
      *
-     * Wasender يرسل:
+     * Wasender قد يرسل:
      * X-Webhook-Signature
-     *
-     * لذلك نقرأ:
-     * x-webhook-signature
      */
     const provided =
       this.getHeader(headers, 'x-webhook-signature') ??
@@ -276,19 +613,14 @@ export class WhatsappTicketRequestsService {
     payload: Record<string, unknown>,
   ): IncomingMessage {
     /**
-     * Wasender يضع بيانات الرسالة داخل:
+     * Wasender يضع بيانات الرسالة غالبًا داخل:
      *
      * data.messages
-     *
-     * وليس مباشرة داخل data.
      */
     const deliveryId =
       this.firstString(payload, [
         'data.messages.key.id',
 
-        /**
-         * Fallbacks لدعم أي Payload قديم أو مختلف.
-         */
         'id',
         'messageId',
         'message_id',
@@ -302,9 +634,6 @@ export class WhatsappTicketRequestsService {
 
     const text =
       this.firstString(payload, [
-        /**
-         * المسارات الأساسية في Wasender.
-         */
         'data.messages.messageBody',
         'data.messages.message.conversation',
         'data.messages.message.extendedTextMessage.text',
@@ -312,9 +641,6 @@ export class WhatsappTicketRequestsService {
         'data.messages.message.videoMessage.caption',
         'data.messages.message.documentMessage.caption',
 
-        /**
-         * Fallbacks للمخططات القديمة.
-         */
         'text',
         'body',
         'message',
@@ -329,16 +655,12 @@ export class WhatsappTicketRequestsService {
     const senderPhone =
       this.firstString(payload, [
         /**
-         * cleanedSenderPn هو الأفضل لأنه رقم جاهز
+         * cleanedSenderPn هو الخيار الأفضل لأنه رقم هاتف
          * وليس WhatsApp LID.
          */
         'data.messages.key.cleanedSenderPn',
         'data.messages.key.senderPn',
 
-        /**
-         * Fallback إلى remoteJid فقط عند عدم وجود
-         * cleanedSenderPn أو senderPn.
-         */
         'data.messages.key.remoteJid',
 
         'from',
@@ -419,12 +741,18 @@ export class WhatsappTicketRequestsService {
     return match?.[1].toUpperCase();
   }
 
+  private extractTicketRequestToken(text: string) {
+    const match = text.match(this.ticketRequestTokenPattern);
+
+    return match?.[1];
+  }
+
   private async recordDelivery(
     deliveryId: string,
     payload: Record<string, unknown>,
   ) {
     try {
-      const created = await (this.prisma as any).webhookDelivery.create({
+      const created = await this.prisma.webhookDelivery.create({
         data: {
           provider: 'WASENDER',
           deliveryId,
@@ -433,13 +761,19 @@ export class WhatsappTicketRequestsService {
         },
       });
 
-      return { id: created.id as string, duplicate: false };
+      return {
+        id: created.id,
+        duplicate: false,
+      };
     } catch (error) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
         error.code === 'P2002'
       ) {
-        return { id: '', duplicate: true };
+        return {
+          id: '',
+          duplicate: true,
+        };
       }
 
       throw error;
@@ -455,8 +789,10 @@ export class WhatsappTicketRequestsService {
       return;
     }
 
-    await (this.prisma as any).webhookDelivery.update({
-      where: { id },
+    await this.prisma.webhookDelivery.update({
+      where: {
+        id,
+      },
       data: {
         status,
         reason,
@@ -470,17 +806,20 @@ export class WhatsappTicketRequestsService {
     key: string,
   ) {
     const direct = headers[key] ?? headers[key.toLowerCase()];
+
     const value = Array.isArray(direct) ? direct[0] : direct;
 
     return typeof value === 'string' ? value : undefined;
   }
 
   private getBearerToken(value?: string) {
-    if (!value?.startsWith('Bearer ')) {
+    if (!value) {
       return undefined;
     }
 
-    return value.slice('Bearer '.length);
+    const match = value.match(/^Bearer\s+(.+)$/i);
+
+    return match?.[1]?.trim();
   }
 
   private firstString(payload: Record<string, unknown>, paths: string[]) {
@@ -534,6 +873,7 @@ export class WhatsappTicketRequestsService {
     const configuredBase = this.configService
       .get<string>('APP_PUBLIC_BASE_URL', '')
       .replace(/\/+$/, '');
+
     const candidate =
       configuredBase && relativePath
         ? `${configuredBase}/${relativePath.replace(/^\/+/, '')}`
@@ -547,10 +887,18 @@ export class WhatsappTicketRequestsService {
       const parsed = new URL(candidate);
       const hostname = parsed.hostname.toLowerCase();
 
-      return parsed.protocol === 'https:' &&
-        !['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname)
-        ? parsed.toString()
-        : null;
+      const isLocalHostname = [
+        'localhost',
+        '127.0.0.1',
+        '::1',
+        '[::1]',
+      ].includes(hostname);
+
+      if (parsed.protocol !== 'https:' || isLocalHostname) {
+        return null;
+      }
+
+      return parsed.toString();
     } catch {
       return null;
     }
