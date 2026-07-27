@@ -665,6 +665,7 @@ model Registration {
   @@index([registeredAt])
   @@index([createdAt])
   @@index([ticketRequestPhone])
+   @@index([eventId, updatedAt, id])
 }
 
 model WebhookDelivery {
@@ -1136,3 +1137,5 @@ model AuditLog {
   @@index([entityId])
   @@index([createdAt])
 }
+
+

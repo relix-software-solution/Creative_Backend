@@ -16,6 +16,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import type { AuthUser } from '../auth/types/auth-user.type';
 import { ListVisitorsQueryDto } from './dto/list-visitors-query.dto';
+import { StaffOfflineSnapshotQueryDto } from './dto/staff-offline-snapshot-query.dto';
 import { UpdateStaffVisitorDto } from './dto/update-staff-visitor.dto';
 import { VisitorsService } from './visitors.service';
 
@@ -24,6 +25,25 @@ import { VisitorsService } from './visitors.service';
 @Roles(UserRole.STAFF)
 export class StaffVisitorsController {
   constructor(private readonly visitorsService: VisitorsService) {}
+
+  /**
+   * تنزيل جميع زوار فعالية الموظف على دفعات مستقرة.
+   *
+   * GET /api/v1/staff/visitors/offline-snapshot
+   * GET /api/v1/staff/visitors/offline-snapshot?cursor=...&limit=500
+   */
+  @Get('offline-snapshot')
+  getOfflineSnapshot(
+    @CurrentUser() user: AuthUser,
+    @Query() query: StaffOfflineSnapshotQueryDto,
+    @Req() request: FastifyRequest,
+  ) {
+    return this.visitorsService.findOfflineSnapshotForStaff(
+      user.id,
+      query,
+      this.getRequestBaseUrl(request),
+    );
+  }
 
   @Get()
   findMine(
@@ -52,6 +72,7 @@ export class StaffVisitorsController {
       request.headers['x-forwarded-proto'] ??
       (request as FastifyRequest & { protocol?: string }).protocol ??
       'http';
+
     const host = request.headers['x-forwarded-host'] ?? request.headers.host;
 
     return host ? `${protocol}://${host}` : undefined;

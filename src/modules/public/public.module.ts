@@ -7,6 +7,7 @@ import { RegistrationsModule } from '../registrations/registrations.module';
 import { WhatsappTicketRequestsModule } from '../whatsapp-ticket-requests/whatsapp-ticket-requests.module';
 import { PublicController } from './public.controller';
 import { PublicService } from './public.service';
+import { QrModule } from '../qr/qr.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { PublicService } from './public.service';
     DigitalTicketsModule,
     RegistrationsModule,
     WhatsappTicketRequestsModule,
+    QrModule,
   ],
   controllers: [PublicController],
   providers: [PublicService],

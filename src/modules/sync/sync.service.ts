@@ -157,9 +157,36 @@ export class SyncService {
     const operations = await this.prisma.syncOperation.findMany({
       where: { syncBatchId: batchId },
     });
+
     const operationsById = new Map(
       operations.map((operation) => [operation.operationId, operation]),
     );
+
+    /**
+     * العمليات الموجودة مسبقًا تعني أن الجهاز يعيد إرسال
+     * نفس operationId.
+     *
+     * يجب أن نقرأ النتيجة الأصلية بدل إرجاع DUPLICATE فارغة،
+     * لأن الفرونت يحتاج registrationId وcanonicalQrToken.
+     */
+    const existingDuplicateOperations =
+      duplicateOperationIds.size > 0
+        ? await this.prisma.syncOperation.findMany({
+            where: {
+              operationId: {
+                in: [...duplicateOperationIds],
+              },
+            },
+          })
+        : [];
+
+    const existingDuplicateOperationsById = new Map(
+      existingDuplicateOperations.map((operation) => [
+        operation.operationId,
+        operation,
+      ]),
+    );
+
     const localRegistrations: LocalRegistrationMap = new Map();
     const operationResults: Array<Record<string, unknown>> = [];
 
@@ -167,10 +194,66 @@ export class SyncService {
       submitSyncBatchDto.operations,
     )) {
       if (duplicateOperationIds.has(operationDto.operationId)) {
+        const existingOperation = existingDuplicateOperationsById.get(
+          operationDto.operationId,
+        );
+
+        if (!existingOperation) {
+          operationResults.push({
+            operationId: operationDto.operationId,
+            status: SyncOperationStatus.FAILED,
+            errorCode: 'DUPLICATE_OPERATION_RESULT_NOT_FOUND',
+            errorMessage:
+              'The operation was previously received but its result could not be found',
+          });
+
+          continue;
+        }
+
+        /**
+         * العملية نُفذت سابقًا بنجاح:
+         * نعيد output الأصلي حتى يستطيع الفرونت الحصول
+         * على registrationId والـQR الرسمي.
+         */
+        if (
+          existingOperation.status === SyncOperationStatus.PROCESSED ||
+          existingOperation.status === SyncOperationStatus.DUPLICATE
+        ) {
+          operationResults.push({
+            operationId: operationDto.operationId,
+            status: SyncOperationStatus.DUPLICATE,
+            output: existingOperation.output,
+          });
+
+          continue;
+        }
+
+        /**
+         * العملية السابقة فشلت.
+         * لا نعرضها كـDuplicate ناجحة.
+         */
+        if (existingOperation.status === SyncOperationStatus.FAILED) {
+          operationResults.push({
+            operationId: operationDto.operationId,
+            status: SyncOperationStatus.FAILED,
+            errorCode:
+              existingOperation.errorCode ?? 'PREVIOUS_OPERATION_FAILED',
+            errorMessage:
+              existingOperation.errorMessage ??
+              'The previous operation attempt failed',
+          });
+
+          continue;
+        }
+
         operationResults.push({
           operationId: operationDto.operationId,
-          status: SyncOperationStatus.DUPLICATE,
+          status: SyncOperationStatus.FAILED,
+          errorCode: 'PREVIOUS_OPERATION_NOT_COMPLETED',
+          errorMessage:
+            'The previous operation has not completed processing yet',
         });
+
         continue;
       }
 
@@ -236,38 +319,22 @@ export class SyncService {
         batch,
         localRegistrations,
       );
-      const status =
-        output && typeof output === 'object' && 'duplicate' in output
-          ? SyncOperationStatus.DUPLICATE
-          : SyncOperationStatus.PROCESSED;
+
+      /**
+       * نجاح تنفيذ العملية يعني PROCESSED.
+       *
+       * لا نعتمد وجود خاصية باسم duplicate داخل output،
+       * لأن DUPLICATE محجوز لإعادة نفس operationId فقط.
+       */
+      const status = SyncOperationStatus.PROCESSED;
 
       await this.prisma.syncOperation.update({
         where: { id: operation.id },
         data: {
           status,
           output: output as Prisma.InputJsonValue,
-          processedAt: new Date(),
-        },
-      });
-
-      return { operationId: operation.operationId, status, output };
-    } catch (error) {
-      const duplicate = error instanceof ConflictException;
-      const status = duplicate
-        ? SyncOperationStatus.DUPLICATE
-        : SyncOperationStatus.FAILED;
-      const errorCode = duplicate
-        ? 'DUPLICATE_REGISTRATION'
-        : 'OPERATION_FAILED';
-      const errorMessage =
-        error instanceof Error ? error.message : 'Operation failed';
-
-      await this.prisma.syncOperation.update({
-        where: { id: operation.id },
-        data: {
-          status,
-          errorCode,
-          errorMessage,
+          errorCode: null,
+          errorMessage: null,
           processedAt: new Date(),
         },
       });
@@ -275,10 +342,143 @@ export class SyncService {
       return {
         operationId: operation.operationId,
         status,
-        errorCode,
-        errorMessage,
+        output,
+      };
+    } catch (error) {
+      const classified = this.classifySyncOperationError(error);
+
+      await this.prisma.syncOperation.update({
+        where: { id: operation.id },
+        data: {
+          status: SyncOperationStatus.FAILED,
+
+          errorCode: classified.code,
+          errorMessage: classified.message,
+
+          processedAt: new Date(),
+        },
+      });
+
+      return {
+        operationId: operation.operationId,
+        status: SyncOperationStatus.FAILED,
+
+        errorCode: classified.code,
+        errorMessage: classified.message,
       };
     }
+  }
+
+  private classifySyncOperationError(error: unknown) {
+    if (error instanceof ConflictException) {
+      const response = error.getResponse();
+
+      if (typeof response === 'string') {
+        return {
+          code: this.getConflictErrorCode(response),
+          message: response,
+        };
+      }
+
+      if (
+        typeof response === 'object' &&
+        response !== null &&
+        !Array.isArray(response)
+      ) {
+        const record = response as Record<string, unknown>;
+
+        const code =
+          typeof record.code === 'string'
+            ? record.code
+            : typeof record.errorCode === 'string'
+              ? record.errorCode
+              : 'DUPLICATE_REGISTRATION';
+
+        const rawMessage = record.message;
+
+        const message = Array.isArray(rawMessage)
+          ? rawMessage
+              .filter((item): item is string => typeof item === 'string')
+              .join(', ')
+          : typeof rawMessage === 'string'
+            ? rawMessage
+            : error.message;
+
+        return {
+          code,
+          message,
+        };
+      }
+
+      return {
+        code: 'DUPLICATE_REGISTRATION',
+        message: error.message || 'Duplicate registration for this event',
+      };
+    }
+
+    if (error instanceof BadRequestException) {
+      return {
+        code: 'INVALID_OFFLINE_REGISTRATION',
+        message: this.getHttpExceptionMessage(error),
+      };
+    }
+
+    if (error instanceof NotFoundException) {
+      return {
+        code: 'OFFLINE_REGISTRATION_RESOURCE_NOT_FOUND',
+        message: this.getHttpExceptionMessage(error),
+      };
+    }
+
+    return {
+      code: 'OPERATION_FAILED',
+      message: error instanceof Error ? error.message : 'Operation failed',
+    };
+  }
+
+  private getConflictErrorCode(message: string) {
+    if (message === 'OFFLINE_REGISTRATION_CONFLICT') {
+      return 'OFFLINE_REGISTRATION_CONFLICT';
+    }
+
+    if (
+      message.includes('Duplicate registration') ||
+      message.includes('unique')
+    ) {
+      return 'DUPLICATE_REGISTRATION';
+    }
+
+    return 'SYNC_OPERATION_CONFLICT';
+  }
+
+  private getHttpExceptionMessage(
+    exception: BadRequestException | NotFoundException | ConflictException,
+  ) {
+    const response = exception.getResponse();
+
+    if (typeof response === 'string') {
+      return response;
+    }
+
+    if (
+      typeof response === 'object' &&
+      response !== null &&
+      !Array.isArray(response)
+    ) {
+      const message = (response as Record<string, unknown>).message;
+
+      if (Array.isArray(message)) {
+        return message
+          .filter((item): item is string => typeof item === 'string')
+          .join(', ');
+      }
+
+      if (typeof message === 'string') {
+        return message;
+      }
+    }
+
+    return exception.message;
   }
 
   private async runOperation(
@@ -287,7 +487,11 @@ export class SyncService {
     localRegistrations: LocalRegistrationMap,
   ) {
     if (operationDto.type === SyncOperationType.OFFLINE_REGISTRATION) {
-      return this.runOfflineRegistration(operationDto, batch, localRegistrations);
+      return this.runOfflineRegistration(
+        operationDto,
+        batch,
+        localRegistrations,
+      );
     }
 
     if (operationDto.type === SyncOperationType.OFFLINE_SCAN) {
@@ -384,14 +588,51 @@ export class SyncService {
             publicId: existingRegistration.publicId,
           });
 
+          const canonicalQr = await this.qrService.generate(
+            existingRegistration.id,
+          );
+
           return {
             status: 'ALREADY_SYNCED',
+
             registrationId: existingRegistration.id,
             publicId: existingRegistration.publicId,
+
+            registration: {
+              id: existingRegistration.id,
+              publicId: existingRegistration.publicId,
+
+              eventId: existingRegistration.eventId,
+              attendeeTypeId: existingRegistration.attendeeTypeId,
+
+              status: existingRegistration.status,
+              source: existingRegistration.source,
+
+              fullName: existingRegistration.fullName,
+              phone: existingRegistration.phone,
+              email: existingRegistration.email,
+
+              companyName: existingRegistration.companyName,
+              jobTitle: existingRegistration.jobTitle,
+              externalId: existingRegistration.externalId,
+
+              customFields: existingRegistration.customFields ?? {},
+              notes: existingRegistration.notes,
+
+              registeredAt: existingRegistration.registeredAt,
+              createdAt: existingRegistration.createdAt,
+              updatedAt: existingRegistration.updatedAt,
+            },
+
             offlineRegistrationOperationId,
             offlineRegistrationId,
             offlineQrToken,
-            canonicalQrTokenId: existingMapping.canonicalQrTokenId,
+
+            canonicalQrTokenId: existingMapping.canonicalQrTokenId ?? null,
+
+            canonicalQrToken: canonicalQr.compactQrToken ?? canonicalQr.qrToken,
+
+            canonicalSignedQrToken: canonicalQr.qrToken,
           };
         }
       }
@@ -436,18 +677,22 @@ export class SyncService {
     } catch (error) {
       await this.prisma.offlineRegistrationMapping.update({
         where: { id: mapping.id },
+
         data: {
           status: OfflineRegistrationMappingStatus.CONFLICTED,
+
           conflictCode:
             error instanceof ConflictException
               ? 'DUPLICATE_REGISTRATION'
               : 'OFFLINE_REGISTRATION_FAILED',
+
           conflictMessage:
             error instanceof Error
               ? error.message
               : 'Offline registration failed',
         },
       });
+
       throw error;
     }
 
@@ -480,13 +725,50 @@ export class SyncService {
 
     return {
       status: 'CREATED',
+
       registrationId: registration.id,
       publicId: registration.publicId,
+
+      registration: {
+        id: registration.id,
+        publicId: registration.publicId,
+        eventId: registration.eventId,
+        attendeeTypeId: registration.attendeeTypeId,
+
+        fullName: registration.fullName,
+        phone: registration.phone,
+        email: registration.email,
+
+        companyName: registration.companyName,
+        jobTitle: registration.jobTitle,
+        externalId: registration.externalId,
+
+        customFields: registration.customFields ?? {},
+        notes: registration.notes,
+
+        status: registration.status,
+        source: registration.source,
+
+        registeredAt: registration.registeredAt,
+        createdAt: registration.createdAt,
+        updatedAt: registration.updatedAt,
+      },
+
       offlineRegistrationOperationId,
       offlineRegistrationId,
       offlineQrToken,
-      canonicalQrTokenId: canonicalQrToken?.id,
-      canonicalQrToken: canonicalQr.qrToken,
+
+      /*
+       * هذا هو التوكن الذي طُبع أثناء Offline.
+       * يجب أن يبقى صالحًا بعد المزامنة.
+       */
+      signedOfflineQr,
+
+      canonicalQrTokenId: canonicalQrToken?.id ?? null,
+
+      canonicalQrToken: canonicalQr.compactQrToken ?? canonicalQr.qrToken,
+
+      canonicalSignedQrToken: canonicalQr.qrToken,
     };
   }
 
@@ -575,7 +857,10 @@ export class SyncService {
   ) {
     const comparisons: Array<[string, string | undefined]> = [
       ['eventId', qrPayload.eventId],
-      ['offlineRegistrationOperationId', qrPayload.offlineRegistrationOperationId],
+      [
+        'offlineRegistrationOperationId',
+        qrPayload.offlineRegistrationOperationId,
+      ],
       ['offlineRegistrationId', qrPayload.offlineRegistrationId],
       ['offlineQrToken', qrPayload.offlineQrToken],
       ['attendeeTypeId', qrPayload.attendeeTypeId],
@@ -617,15 +902,19 @@ export class SyncService {
     failedCount: number,
     duplicateCount: number,
   ) {
-    if (failedCount === 0) {
-      return SyncBatchStatus.COMPLETED;
+    if (failedCount > 0) {
+      if (processedCount === 0 && duplicateCount === 0) {
+        return SyncBatchStatus.FAILED;
+      }
+
+      return SyncBatchStatus.PARTIAL_FAILED;
     }
 
-    if (processedCount === 0 && duplicateCount === 0) {
-      return SyncBatchStatus.FAILED;
+    if (processedCount === 0 && duplicateCount > 0) {
+      return SyncBatchStatus.DUPLICATE;
     }
 
-    return SyncBatchStatus.PARTIAL_FAILED;
+    return SyncBatchStatus.COMPLETED;
   }
 
   private async ensureEventCanBeModified(eventId: string) {
@@ -727,7 +1016,13 @@ export class SyncService {
   private getOptionalString(payload: Record<string, unknown>, key: string) {
     const value = payload[key];
 
-    return typeof value === 'string' && value.length > 0 ? value : undefined;
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+
+    const trimmed = value.trim();
+
+    return trimmed.length > 0 ? trimmed : undefined;
   }
 
   private getOptionalRecord(payload: Record<string, unknown>, key: string) {

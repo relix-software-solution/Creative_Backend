@@ -23,7 +23,8 @@ export class StaffSessionsController {
   constructor(private readonly staffSessionsService: StaffSessionsService) {}
 
   @Post('start')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.STAFF, UserRole.SUPER_ADMIN)
   start(
     @CurrentUser() currentUser: AuthUser,
     @Body() startStaffSessionDto: StartStaffSessionDto,
@@ -36,6 +37,21 @@ export class StaffSessionsController {
   @Roles(UserRole.STAFF)
   startMySession(@CurrentUser() currentUser: AuthUser) {
     return this.staffSessionsService.startMySession(currentUser);
+  }
+
+  /*
+   * يسمح للموظف بإنهاء جلساته الفعالة بنفسه.
+   *
+   * هذا المسار سنستخدمه لاحقًا عند:
+   * - تسجيل الخروج.
+   * - تغيير الجهاز.
+   * - إنهاء الوردية.
+   */
+  @Post('end-my-session')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.STAFF)
+  endMySession(@CurrentUser() currentUser: AuthUser) {
+    return this.staffSessionsService.endMySession(currentUser);
   }
 
   @Get()

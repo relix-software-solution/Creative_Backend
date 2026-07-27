@@ -1,6 +1,7 @@
 import { Transform } from 'class-transformer';
 import {
   IsEmail,
+  IsISO8601,
   IsNotEmpty,
   IsObject,
   IsOptional,
@@ -9,6 +10,16 @@ import {
 } from 'class-validator';
 
 export class UpdateStaffVisitorDto {
+  /**
+   * تاريخ النسخة التي عدّل عليها الموظف.
+   *
+   * يستخدم لمنع تعديل Offline قديم من الكتابة
+   * فوق تعديل أحدث موجود على السيرفر.
+   */
+  @IsOptional()
+  @IsISO8601()
+  expectedUpdatedAt?: string;
+
   @IsOptional()
   @IsString()
   @IsNotEmpty()

@@ -10,5 +10,6 @@ import { VisitorsService } from './visitors.service';
   imports: [BadgeTemplatesModule, QrModule, RegistrationsModule],
   controllers: [AdminVisitorsController, StaffVisitorsController],
   providers: [VisitorsService],
+  exports: [VisitorsService],
 })
 export class VisitorsModule {}

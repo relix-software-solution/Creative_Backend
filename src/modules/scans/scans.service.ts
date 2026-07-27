@@ -672,16 +672,16 @@ export class ScansService {
       this.configService.getOrThrow<string>('QR_SIGNING_SECRET');
 
     try {
-      payload = verifySignedQrToken(qrRaw, qrSigningSecret) as unknown as Record<
-        string,
-        unknown
-      >;
+      payload = verifySignedQrToken(
+        qrRaw,
+        qrSigningSecret,
+      ) as unknown as Record<string, unknown>;
     } catch {
       try {
-        payload = verifyCompactQrToken(qrRaw, qrSigningSecret) as unknown as Record<
-          string,
-          unknown
-        >;
+        payload = verifyCompactQrToken(
+          qrRaw,
+          qrSigningSecret,
+        ) as unknown as Record<string, unknown>;
       } catch {
         try {
           return await this.validateOfflineQrForScan(qrRaw, eventId);

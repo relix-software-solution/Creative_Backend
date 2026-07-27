@@ -4,6 +4,7 @@ import { BadgeTemplatesModule } from '../badge-templates/badge-templates.module'
 import { OfflineModule } from '../offline/offline.module';
 import { QUEUE_NAMES } from '../queue/queue.constants';
 import { QrModule } from '../qr/qr.module';
+import { StaffAccessModule } from '../staff-access/staff-access.module';
 import { ScansController } from './scans.controller';
 import { ScansService } from './scans.service';
 
@@ -12,6 +13,7 @@ import { ScansService } from './scans.service';
     BadgeTemplatesModule,
     OfflineModule,
     QrModule,
+    StaffAccessModule,
     BullModule.registerQueue({
       name: QUEUE_NAMES.SCAN_PROCESSING,
     }),

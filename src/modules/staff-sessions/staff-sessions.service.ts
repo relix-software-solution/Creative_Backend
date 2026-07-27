@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  Checkpoint,
   CheckpointType,
   DeviceStatus,
   EventStatus,
@@ -12,6 +13,7 @@ import {
   StaffScanMode,
   StaffSessionStatus,
   UserRole,
+  UserStatus,
 } from '@prisma/client';
 import {
   createPaginatedResponse,
@@ -28,17 +30,26 @@ type SafeStaffSessionPayload = {
   checkpointId: string;
   deviceId: string;
   staffUserId: string;
+  mode: StaffScanMode;
   status: StaffSessionStatus;
+  startedAt: Date;
+  endedAt: Date | null;
+  lastSeenAt: Date | null;
+
   event: {
     id: string;
     titleAr: string;
     titleEn: string | null;
   };
+
   checkpoint: {
     id: string;
     nameAr: string;
+    nameEn?: string | null;
+    code?: string;
     type: CheckpointType;
   };
+
   device: {
     id: string;
     name: string;
@@ -50,29 +61,52 @@ type SafeStaffSessionPayload = {
 export class StaffSessionsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async start(currentUser: AuthUser, startStaffSessionDto: StartStaffSessionDto) {
+  async start(
+    currentUser: AuthUser,
+    startStaffSessionDto: StartStaffSessionDto,
+  ) {
     const staffUserId = this.resolveStaffUserId(
       currentUser,
       startStaffSessionDto.staffUserId,
     );
-    const now = new Date();
 
     await this.ensureEventCanBeModified(startStaffSessionDto.eventId);
     await this.ensureStaffUser(staffUserId);
-    await this.ensureActiveAssignment(startStaffSessionDto.eventId, staffUserId);
-    await this.ensureActiveDeviceBelongsToEvent(
+
+    const device = await this.ensureActiveDeviceBelongsToEvent(
       startStaffSessionDto.deviceId,
       startStaffSessionDto.eventId,
     );
-    await this.ensureActiveCheckpointBelongsToEvent(
+
+    const checkpoint = await this.ensureActiveCheckpointBelongsToEvent(
       startStaffSessionDto.checkpointId,
       startStaffSessionDto.eventId,
     );
 
+    await this.ensureActiveAssignmentBinding({
+      eventId: startStaffSessionDto.eventId,
+      staffUserId,
+      deviceId: device.id,
+      checkpointId: checkpoint.id,
+    });
+
+    const expectedMode = this.resolveModeForCheckpoint(checkpoint.type);
+
+    if (startStaffSessionDto.mode !== expectedMode) {
+      throw new BadRequestException(
+        `Staff session mode must match checkpoint type. Expected ${expectedMode}`,
+      );
+    }
+
+    const now = new Date();
+
     return this.prisma.$transaction(async (tx) => {
+      /*
+       * الموظف لا يجب أن يمتلك جلستين فعالتين في الوقت نفسه،
+       * حتى لو كانتا ضمن فعاليتين مختلفتين.
+       */
       await tx.staffSession.updateMany({
         where: {
-          eventId: startStaffSessionDto.eventId,
           staffUserId,
           status: StaffSessionStatus.ACTIVE,
         },
@@ -81,6 +115,11 @@ export class StaffSessionsService {
           endedAt: now,
         },
       });
+
+      /*
+       * الجهاز نفسه لا يجب أن يكون مستخدمًا من جلستين
+       * فعالتين ضمن الفعالية نفسها.
+       */
       await tx.staffSession.updateMany({
         where: {
           eventId: startStaffSessionDto.eventId,
@@ -99,8 +138,9 @@ export class StaffSessionsService {
           staffUserId,
           deviceId: startStaffSessionDto.deviceId,
           checkpointId: startStaffSessionDto.checkpointId,
-          mode: startStaffSessionDto.mode,
+          mode: expectedMode,
           status: StaffSessionStatus.ACTIVE,
+          startedAt: now,
           lastSeenAt: now,
           metadata:
             startStaffSessionDto.metadata === undefined
@@ -111,8 +151,12 @@ export class StaffSessionsService {
       });
 
       await tx.device.update({
-        where: { id: startStaffSessionDto.deviceId },
-        data: { lastSeenAt: now },
+        where: {
+          id: startStaffSessionDto.deviceId,
+        },
+        data: {
+          lastSeenAt: now,
+        },
       });
 
       return staffSession;
@@ -120,13 +164,24 @@ export class StaffSessionsService {
   }
 
   async startMySession(currentUser: AuthUser) {
+    if (currentUser.role !== UserRole.STAFF) {
+      throw new ForbiddenException(
+        'Only STAFF can start their own scanner session',
+      );
+    }
+
+    await this.ensureStaffUser(currentUser.id);
+
     const assignment = await this.prisma.staffAssignment.findFirst({
       where: {
         userId: currentUser.id,
         isActive: true,
       },
-      orderBy: { updatedAt: 'desc' },
+      orderBy: {
+        updatedAt: 'desc',
+      },
       include: {
+        event: true,
         checkpoint: true,
         device: true,
       },
@@ -136,18 +191,24 @@ export class StaffSessionsService {
       throw new NotFoundException('No active staff assignment found');
     }
 
-    if (!assignment.checkpointId || !assignment.deviceId) {
+    if (!assignment.checkpointId || !assignment.checkpoint) {
       throw new BadRequestException(
-        'Active staff assignment must include checkpointId and deviceId',
+        'Active staff assignment must include checkpointId',
       );
     }
 
-    if (!assignment.checkpoint) {
-      throw new NotFoundException('Checkpoint not found');
+    if (!assignment.deviceId || !assignment.device) {
+      throw new BadRequestException(
+        'Active staff assignment must include deviceId',
+      );
     }
 
-    if (!assignment.device) {
-      throw new NotFoundException('Device not found');
+    if (!assignment.checkpoint.isActive) {
+      throw new BadRequestException('Assigned checkpoint must be active');
+    }
+
+    if (assignment.device.status !== DeviceStatus.ACTIVE) {
+      throw new BadRequestException('Assigned device must be ACTIVE');
     }
 
     const staffSession = await this.start(currentUser, {
@@ -156,18 +217,78 @@ export class StaffSessionsService {
       checkpointId: assignment.checkpointId,
       deviceId: assignment.deviceId,
       mode: this.resolveModeForCheckpoint(assignment.checkpoint.type),
+      metadata: {
+        source: 'START_MY_SESSION',
+        assignmentId: assignment.id,
+      },
     });
 
     return this.toSafeSessionResponse(staffSession);
   }
 
+  async endMySession(currentUser: AuthUser) {
+    if (currentUser.role !== UserRole.STAFF) {
+      throw new ForbiddenException(
+        'Only STAFF can end their own scanner session',
+      );
+    }
+
+    const now = new Date();
+
+    const activeSessions = await this.prisma.staffSession.findMany({
+      where: {
+        staffUserId: currentUser.id,
+        status: StaffSessionStatus.ACTIVE,
+      },
+      select: {
+        id: true,
+      },
+    });
+
+    if (activeSessions.length === 0) {
+      return {
+        ended: true,
+        endedCount: 0,
+        message: 'No active staff session found',
+      };
+    }
+
+    const result = await this.prisma.staffSession.updateMany({
+      where: {
+        id: {
+          in: activeSessions.map((session) => session.id),
+        },
+        status: StaffSessionStatus.ACTIVE,
+      },
+      data: {
+        status: StaffSessionStatus.ENDED,
+        endedAt: now,
+      },
+    });
+
+    return {
+      ended: true,
+      endedCount: result.count,
+      endedAt: now,
+    };
+  }
+
   async findAll(query: ListStaffSessionsQueryDto) {
     const { page, limit, skip } = normalizePagination(query);
+
     const where: Prisma.StaffSessionWhereInput = {
       ...(query.eventId ? { eventId: query.eventId } : {}),
-      ...(query.staffUserId ? { staffUserId: query.staffUserId } : {}),
+      ...(query.staffUserId
+        ? {
+            staffUserId: query.staffUserId,
+          }
+        : {}),
       ...(query.deviceId ? { deviceId: query.deviceId } : {}),
-      ...(query.checkpointId ? { checkpointId: query.checkpointId } : {}),
+      ...(query.checkpointId
+        ? {
+            checkpointId: query.checkpointId,
+          }
+        : {}),
       ...(query.status ? { status: query.status } : {}),
     };
 
@@ -176,10 +297,15 @@ export class StaffSessionsService {
         where,
         skip,
         take: limit,
-        orderBy: { startedAt: 'desc' },
+        orderBy: {
+          startedAt: 'desc',
+        },
         include: this.staffSessionInclude,
       }),
-      this.prisma.staffSession.count({ where }),
+
+      this.prisma.staffSession.count({
+        where,
+      }),
     ]);
 
     return createPaginatedResponse(items, total, page, limit);
@@ -187,7 +313,9 @@ export class StaffSessionsService {
 
   async findOne(id: string) {
     const staffSession = await this.prisma.staffSession.findUnique({
-      where: { id },
+      where: {
+        id,
+      },
       include: this.staffSessionInclude,
     });
 
@@ -206,7 +334,9 @@ export class StaffSessionsService {
     }
 
     return this.prisma.staffSession.update({
-      where: { id },
+      where: {
+        id,
+      },
       data: {
         status: StaffSessionStatus.ENDED,
         endedAt: new Date(),
@@ -218,13 +348,18 @@ export class StaffSessionsService {
   async remove(id: string) {
     const staffSession = await this.end(id);
 
-    return { ended: true, staffSession };
+    return {
+      ended: true,
+      staffSession,
+    };
   }
 
   private resolveStaffUserId(currentUser: AuthUser, staffUserId?: string) {
     if (currentUser.role === UserRole.STAFF) {
       if (staffUserId && staffUserId !== currentUser.id) {
-        throw new ForbiddenException('staffUserId is only allowed for SUPER_ADMIN');
+        throw new ForbiddenException(
+          'STAFF cannot start a session for another user',
+        );
       }
 
       return currentUser.id;
@@ -232,18 +367,24 @@ export class StaffSessionsService {
 
     if (currentUser.role === UserRole.SUPER_ADMIN) {
       if (!staffUserId) {
-        throw new BadRequestException('staffUserId is required for SUPER_ADMIN');
+        throw new BadRequestException(
+          'staffUserId is required for SUPER_ADMIN',
+        );
       }
 
       return staffUserId;
     }
 
-    throw new ForbiddenException('Only STAFF or SUPER_ADMIN can start sessions');
+    throw new ForbiddenException(
+      'Only STAFF or SUPER_ADMIN can start sessions',
+    );
   }
 
   private async ensureEventCanBeModified(eventId: string) {
     const event = await this.prisma.event.findUnique({
-      where: { id: eventId },
+      where: {
+        id: eventId,
+      },
     });
 
     if (!event) {
@@ -253,11 +394,15 @@ export class StaffSessionsService {
     if (event.status === EventStatus.ARCHIVED) {
       throw new BadRequestException('Archived events cannot be modified');
     }
+
+    return event;
   }
 
   private async ensureStaffUser(userId: string) {
     const user = await this.prisma.user.findUnique({
-      where: { id: userId },
+      where: {
+        id: userId,
+      },
     });
 
     if (!user) {
@@ -267,14 +412,25 @@ export class StaffSessionsService {
     if (user.role !== UserRole.STAFF) {
       throw new BadRequestException('User must have STAFF role');
     }
+
+    if (user.status !== UserStatus.ACTIVE) {
+      throw new BadRequestException('Staff user must be ACTIVE');
+    }
+
+    return user;
   }
 
-  private async ensureActiveAssignment(eventId: string, userId: string) {
+  private async ensureActiveAssignmentBinding(input: {
+    eventId: string;
+    staffUserId: string;
+    deviceId: string;
+    checkpointId: string;
+  }) {
     const assignment = await this.prisma.staffAssignment.findUnique({
       where: {
         eventId_userId: {
-          eventId,
-          userId,
+          eventId: input.eventId,
+          userId: input.staffUserId,
         },
       },
     });
@@ -284,6 +440,32 @@ export class StaffSessionsService {
         'Staff user must have an active assignment for this event',
       );
     }
+
+    if (!assignment.deviceId) {
+      throw new BadRequestException(
+        'Staff assignment does not include a device',
+      );
+    }
+
+    if (!assignment.checkpointId) {
+      throw new BadRequestException(
+        'Staff assignment does not include a checkpoint',
+      );
+    }
+
+    if (assignment.deviceId !== input.deviceId) {
+      throw new BadRequestException(
+        'Session device must match the staff assignment device',
+      );
+    }
+
+    if (assignment.checkpointId !== input.checkpointId) {
+      throw new BadRequestException(
+        'Session checkpoint must match the staff assignment checkpoint',
+      );
+    }
+
+    return assignment;
   }
 
   private async ensureActiveDeviceBelongsToEvent(
@@ -291,7 +473,9 @@ export class StaffSessionsService {
     eventId: string,
   ) {
     const device = await this.prisma.device.findUnique({
-      where: { id: deviceId },
+      where: {
+        id: deviceId,
+      },
     });
 
     if (!device) {
@@ -305,14 +489,18 @@ export class StaffSessionsService {
     if (device.status !== DeviceStatus.ACTIVE) {
       throw new BadRequestException('Device must be ACTIVE');
     }
+
+    return device;
   }
 
   private async ensureActiveCheckpointBelongsToEvent(
     checkpointId: string,
     eventId: string,
-  ) {
+  ): Promise<Checkpoint> {
     const checkpoint = await this.prisma.checkpoint.findUnique({
-      where: { id: checkpointId },
+      where: {
+        id: checkpointId,
+      },
     });
 
     if (!checkpoint) {
@@ -326,6 +514,8 @@ export class StaffSessionsService {
     if (!checkpoint.isActive) {
       throw new BadRequestException('Checkpoint must be active');
     }
+
+    return checkpoint;
   }
 
   private resolveModeForCheckpoint(type: CheckpointType) {
@@ -359,17 +549,26 @@ export class StaffSessionsService {
       checkpointId: staffSession.checkpointId,
       deviceId: staffSession.deviceId,
       staffUserId: staffSession.staffUserId,
+      mode: staffSession.mode,
       status: staffSession.status,
+      startedAt: staffSession.startedAt,
+      endedAt: staffSession.endedAt,
+      lastSeenAt: staffSession.lastSeenAt,
+
       event: {
         id: staffSession.event.id,
         titleAr: staffSession.event.titleAr,
         titleEn: staffSession.event.titleEn,
       },
+
       checkpoint: {
         id: staffSession.checkpoint.id,
         nameAr: staffSession.checkpoint.nameAr,
+        nameEn: staffSession.checkpoint.nameEn ?? null,
+        code: staffSession.checkpoint.code,
         type: staffSession.checkpoint.type,
       },
+
       device: {
         id: staffSession.device.id,
         name: staffSession.device.name,
@@ -380,8 +579,14 @@ export class StaffSessionsService {
 
   private readonly staffSessionInclude = {
     event: {
-      select: { id: true, titleAr: true, titleEn: true, status: true },
+      select: {
+        id: true,
+        titleAr: true,
+        titleEn: true,
+        status: true,
+      },
     },
+
     staffUser: {
       select: {
         id: true,
@@ -392,6 +597,7 @@ export class StaffSessionsService {
         status: true,
       },
     },
+
     device: {
       select: {
         id: true,
@@ -401,6 +607,7 @@ export class StaffSessionsService {
         lastSeenAt: true,
       },
     },
+
     checkpoint: {
       select: {
         id: true,

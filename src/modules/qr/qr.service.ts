@@ -108,6 +108,62 @@ export class QrService {
     return this.formatQrToken(qrToken as QrTokenWithPayload);
   }
 
+  createCompactTokenForOffline(tokenId: string) {
+    if (!tokenId?.trim()) {
+      throw new BadRequestException('QR token ID is required');
+    }
+
+    return createCompactQrToken(tokenId.trim(), this.signingSecret);
+  }
+
+  createSignedTokenForOfflineSnapshot(
+    payloadValue: Prisma.JsonValue,
+    expectedTokenId: string,
+  ) {
+    if (
+      !payloadValue ||
+      typeof payloadValue !== 'object' ||
+      Array.isArray(payloadValue)
+    ) {
+      throw new BadRequestException('Stored QR payload is invalid');
+    }
+
+    const payload = payloadValue as unknown as Partial<QrPayload>;
+
+    const requiredFields: Array<keyof QrPayload> = [
+      'tokenId',
+      'eventId',
+      'registrationId',
+      'registrationPublicId',
+      'attendeeTypeId',
+      'attendeeTypeCode',
+      'issuedAt',
+      'validFrom',
+      'validUntil',
+      'nonce',
+    ];
+
+    const invalidPayload = requiredFields.some((key) => {
+      const value = payload[key];
+
+      return typeof value !== 'string' || value.trim().length === 0;
+    });
+
+    if (invalidPayload) {
+      throw new BadRequestException('Stored QR payload is incomplete');
+    }
+
+    if (payload.tokenId !== expectedTokenId) {
+      throw new BadRequestException('Stored QR token ID mismatch');
+    }
+
+    /*
+     * نستخدم نفس Payload المخزن كما هو.
+     * هذا يجعل Full QR الناتج مطابقًا للرمز الذي يرجعه generate().
+     */
+    return createSignedQrToken(payload as QrPayload, this.signingSecret);
+  }
+
   async validate(qrToken: string) {
     let payload: QrPayload | CompactQrPayload;
 

@@ -21,6 +21,7 @@ import { WhatsappTicketRequestsService } from '../whatsapp-ticket-requests/whats
 import { ListPublicEventsQueryDto } from './dto/list-public-events-query.dto';
 import { PublicRegisterDto } from './dto/public-register.dto';
 import { DigitalTicketsService } from '../digital-tickets/digital-tickets.service';
+import { QrService } from '../qr/qr.service';
 
 const publicEventSelect = {
   id: true,
@@ -40,15 +41,16 @@ const publicEventSelect = {
 export class PublicService {
   private readonly logger = new Logger(PublicService.name);
 
-constructor(
-  private readonly prisma: PrismaService,
-  private readonly badgeTemplatesService: BadgeTemplatesService,
-  private readonly digitalTicketTemplatesService: DigitalTicketTemplatesService,
-  private readonly digitalTicketStatusService: DigitalTicketStatusService,
-  private readonly digitalTicketsService: DigitalTicketsService,
-  private readonly registrationsService: RegistrationsService,
-  private readonly whatsappTicketRequestsService: WhatsappTicketRequestsService,
-) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly badgeTemplatesService: BadgeTemplatesService,
+    private readonly digitalTicketTemplatesService: DigitalTicketTemplatesService,
+    private readonly digitalTicketStatusService: DigitalTicketStatusService,
+    private readonly digitalTicketsService: DigitalTicketsService,
+    private readonly registrationsService: RegistrationsService,
+    private readonly whatsappTicketRequestsService: WhatsappTicketRequestsService,
+    private readonly qrService: QrService,
+  ) {}
 
   async findEvents(query: ListPublicEventsQueryDto) {
     const { page, limit, skip } = normalizePagination(query);
@@ -187,105 +189,162 @@ constructor(
       registrationFields,
     };
   }
-async register(eventId: string, dto: PublicRegisterDto) {
-  const event = await this.prisma.event.findUnique({
-    where: { id: eventId },
-    select: {
-      id: true,
-      isActive: true,
-    },
-  });
+  async register(eventId: string, dto: PublicRegisterDto) {
+    const event = await this.prisma.event.findUnique({
+      where: { id: eventId },
+      select: {
+        id: true,
+        isActive: true,
+      },
+    });
 
-  if (!event) {
-    throw new NotFoundException('Event not found');
-  }
+    if (!event) {
+      throw new NotFoundException('Event not found');
+    }
 
-  if (!event.isActive) {
-    throw new BadRequestException(
-      'Event is not open for public registration',
-    );
-  }
-
-  /*
-   * The public registration contract requires a ready Digital Ticket image.
-   * Verify that an applicable active template exists before creating the
-   * registration, so we do not create a registration that cannot produce
-   * the required response.
-   */
-  const templateExists = await this.prisma.digitalTicketTemplate.findFirst({
-    where: {
-      eventId,
-      isActive: true,
-      OR: [
-        { attendeeTypeId: dto.attendeeTypeId },
-        { attendeeTypeId: null },
-      ],
-    },
-    select: { id: true },
-  });
-
-  if (!templateExists) {
-    throw new BadRequestException(
-      'Digital ticket template is not configured for this event',
-    );
-  }
-
-  const registration = await this.registrationsService.create({
-    ...dto,
-    eventId,
-    source: RegistrationSource.PUBLIC,
-  });
-
-  let generatedTicket: Awaited<
-    ReturnType<DigitalTicketsService['generateForRegistration']>
-  >;
-
-  try {
-    /*
-     * Intentionally synchronous for the public registration response:
-     * the endpoint does not return until the final PNG exists.
-     */
-    generatedTicket =
-      await this.digitalTicketsService.generateForRegistration(
-        registration.id,
-        {
-          forceRegenerate: true,
-        },
+    if (!event.isActive) {
+      throw new BadRequestException(
+        'Event is not open for public registration',
       );
-  } catch (error) {
-    this.logger.error(
-      `Digital ticket generation failed for registration ${registration.id}`,
-      error instanceof Error ? error.stack : undefined,
-    );
+    }
 
-    throw new ServiceUnavailableException(
-      'Registration was created, but the Digital Ticket image could not be generated',
-    );
+    const templateExists = await this.prisma.digitalTicketTemplate.findFirst({
+      where: {
+        eventId,
+        isActive: true,
+        OR: [{ attendeeTypeId: dto.attendeeTypeId }, { attendeeTypeId: null }],
+      },
+      select: { id: true },
+    });
+
+    if (!templateExists) {
+      throw new BadRequestException(
+        'Digital ticket template is not configured for this event',
+      );
+    }
+
+    const registration = await this.registrationsService.create({
+      ...dto,
+      eventId,
+      source: RegistrationSource.PUBLIC,
+    });
+
+    /*
+     * نولد QR ضمن نفس الطلب.
+     *
+     * بهذا لا يعتمد Staff Scanner على الـBackground Pipeline،
+     * ويحصل فورًا على registrationId وQR رسمي.
+     */
+    const qr = await this.qrService.generate(registration.id);
+
+    let generatedTicket: Awaited<
+      ReturnType<DigitalTicketsService['generateForRegistration']>
+    >;
+
+    try {
+      generatedTicket =
+        await this.digitalTicketsService.generateForRegistration(
+          registration.id,
+          {
+            forceRegenerate: true,
+          },
+        );
+    } catch (error) {
+      this.logger.error(
+        `Digital ticket generation failed for registration ${registration.id}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+
+      throw new ServiceUnavailableException(
+        'Registration was created, but the Digital Ticket image could not be generated',
+      );
+    }
+
+    const whatsappRequest = await this.createWhatsappRequest(registration.id);
+
+    return {
+      registration: {
+        id: registration.id,
+        publicId: registration.publicId,
+
+        eventId: registration.eventId,
+        attendeeTypeId: registration.attendeeTypeId,
+
+        fullName: registration.fullName,
+        phone: registration.phone,
+        email: registration.email,
+
+        companyName: registration.companyName,
+        jobTitle: registration.jobTitle,
+        externalId: registration.externalId,
+
+        customFields: registration.customFields ?? {},
+        notes: registration.notes,
+
+        status: registration.status,
+        source: registration.source,
+
+        registeredAt: registration.registeredAt,
+        createdAt: registration.createdAt,
+        updatedAt: registration.updatedAt,
+      },
+
+      qr: {
+        qrToken: qr.compactQrToken ?? qr.qrToken,
+        compactQrToken: qr.compactQrToken,
+        signedToken: qr.qrToken,
+
+        status: qr.status,
+        validFrom: qr.validFrom,
+        validUntil: qr.validUntil,
+        generatedAt: qr.generatedAt,
+      },
+
+      /*
+       * نكرر أهم القيم في المستوى الأعلى لتسهيل التوافق
+       * مع العملاء القديمة.
+       */
+      id: registration.id,
+      publicId: registration.publicId,
+
+      fullName: registration.fullName,
+      phone: registration.phone,
+      email: registration.email,
+
+      companyName: registration.companyName,
+      jobTitle: registration.jobTitle,
+      externalId: registration.externalId,
+
+      customFields: registration.customFields ?? {},
+      notes: registration.notes,
+
+      attendeeTypeId: registration.attendeeTypeId,
+      status: registration.status,
+
+      qrToken: qr.compactQrToken ?? qr.qrToken,
+
+      digitalTicket: {
+        status: 'READY',
+        imageUrl: generatedTicket.imageUrl,
+        relativePath: generatedTicket.relativePath,
+
+        generatedAt:
+          generatedTicket.generatedAt?.toISOString?.() ??
+          generatedTicket.generatedAt ??
+          null,
+
+        templateVersion: generatedTicket.templateVersion,
+        pollUrl: null,
+      },
+
+      whatsappRequest: this.publicWhatsappRequest(whatsappRequest),
+    };
   }
-
-  const whatsappRequest = await this.createWhatsappRequest(registration.id);
-
-  return {
-    registration: this.publicRegistration(registration),
-
-    digitalTicket: {
-      status: 'READY',
-      imageUrl: generatedTicket.imageUrl,
-      relativePath: generatedTicket.relativePath,
-      generatedAt:
-        generatedTicket.generatedAt?.toISOString?.() ??
-        generatedTicket.generatedAt ??
-        null,
-      templateVersion: generatedTicket.templateVersion,
-      pollUrl: null,
-    },
-
-    whatsappRequest: this.publicWhatsappRequest(whatsappRequest),
-  };
-}
   async findDigitalTicket(publicId: string, token?: string) {
     if (!token) {
-      throw new UnauthorizedException('Digital ticket access token is required');
+      throw new UnauthorizedException(
+        'Digital ticket access token is required',
+      );
     }
 
     const registration = await (this.prisma.registration as any).findUnique({
@@ -336,25 +395,6 @@ async register(eventId: string, dto: PublicRegisterDto) {
         expiresAt: null,
       };
     }
-  }
-
-  private publicRegistration(registration: {
-    id: string;
-    publicId: string;
-    eventId: string;
-    fullName: string;
-    phone: string | null;
-    email: string | null;
-    status: string;
-  }) {
-    return {
-      publicId: registration.publicId,
-      eventId: registration.eventId,
-      fullName: registration.fullName,
-      phone: registration.phone,
-      email: registration.email,
-      status: registration.status,
-    };
   }
 
   private publicWhatsappRequest(input: {

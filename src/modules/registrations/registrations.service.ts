@@ -75,55 +75,12 @@ export class RegistrationsService {
     const registrationInput: RegistrationInput = {
       eventId: dto.eventId,
       attendeeTypeId: dto.attendeeTypeId,
+
       phone: dto.phone,
       email: dto.email,
+
       externalId: dto.externalId ?? null,
     };
-
-    /**
-     * بما أن phone مطلوب ويوجد Unique Constraint على:
-     *
-     * eventId + phone
-     *
-     * نبحث أولًا عن تسجيل مؤرشف بنفس الهاتف والفعالية.
-     * إذا وجدناه، نعيد استخدام نفس السجل بدل إنشاء سجل جديد.
-     */
-    const archivedRegistration = await this.findArchivedRegistrationByPhone(
-      dto.eventId,
-      dto.phone,
-    );
-
-    if (archivedRegistration) {
-      /**
-       * نستثني السجل الذي سنعيد تفعيله،
-       * لكن نتحقق من عدم تعارض البريد أو externalId
-       * مع تسجيل آخر.
-       */
-      await this.ensureDuplicateAllowed(
-        event,
-        registrationInput,
-        archivedRegistration.id,
-      );
-
-      await this.validateCustomFields(
-        dto.eventId,
-        dto.attendeeTypeId,
-        dto.customFields ?? {},
-      );
-
-      const restoredRegistration = await this.restoreArchivedRegistration(
-        archivedRegistration.id,
-        dto,
-      );
-
-      void this.enqueueRegistrationPipeline(
-        restoredRegistration.id,
-        restoredRegistration.eventId,
-        restoredRegistration.source,
-      );
-
-      return restoredRegistration;
-    }
 
     await this.ensureDuplicateAllowed(event, registrationInput);
 
@@ -260,43 +217,114 @@ export class RegistrationsService {
 
     await this.ensureEventCanBeModified(registration.eventId);
 
-    return this.prisma.$transaction(async (tx) => {
-      const now = new Date();
-
-      await tx.qrToken.updateMany({
+    const deletedRelations = await this.prisma.$transaction(async (tx) => {
+      /*
+       * الترتيب مهم بسبب العلاقات والمفاتيح الأجنبية.
+       *
+       * OfflineScanOperation قد يرتبط بـ:
+       * - Registration
+       * - MovementLog
+       * - ScanEventRaw
+       *
+       * لذلك يُحذف أولًا.
+       */
+      const offlineScans = await tx.offlineScanOperation.deleteMany({
         where: {
           registrationId: id,
-          status: QrTokenStatus.ACTIVE,
-        },
-        data: {
-          status: QrTokenStatus.REVOKED,
-          revokedAt: now,
         },
       });
 
-      const archivedRegistration = await tx.registration.update({
-        where: { id },
-        data: {
-          status: RegistrationStatus.ARCHIVED,
-
-          /**
-           * إبطال أي رابط أو Token قديم متعلق
-           * بطلب البطاقة.
-           */
-          ticketRequestToken: null,
-          ticketRequestExpiresAt: null,
-          ticketRequestCreatedAt: null,
-          ticketRequestConsumedAt: null,
+      /*
+       * Mapping يرتبط بالتسجيل وبـQR الرسمي.
+       */
+      const offlineMappings = await tx.offlineRegistrationMapping.deleteMany({
+        where: {
+          registrationId: id,
         },
-        include: this.registrationInclude,
+      });
+
+      /*
+       * صور التذاكر الرقمية المسجلة في قاعدة البيانات.
+       */
+      const digitalTicketImages = await tx.digitalTicketImage.deleteMany({
+        where: {
+          registrationId: id,
+        },
+      });
+
+      /*
+       * نحذف سجلات الإشعارات المرتبطة بالزائر.
+       */
+      const notificationLogs = await tx.notificationLog.deleteMany({
+        where: {
+          registrationId: id,
+        },
+      });
+
+      /*
+       * بما أنك تريد حذفًا كاملًا، نحذف ImportRow المرتبط
+       * بدل إبقائه مرتبطًا بسجل لم يعد موجودًا.
+       */
+      const importRows = await tx.importRow.deleteMany({
+        where: {
+          registrationId: id,
+        },
+      });
+
+      /*
+       * MovementLog يعتمد على ScanEventRaw،
+       * لذلك يجب حذف الحركات قبل السكانات الخام.
+       */
+      const movements = await tx.movementLog.deleteMany({
+        where: {
+          registrationId: id,
+        },
+      });
+
+      const rawScans = await tx.scanEventRaw.deleteMany({
+        where: {
+          registrationId: id,
+        },
+      });
+
+      /*
+       * بعد حذف السكانات والحركات يمكن حذف QR.
+       */
+      const qrTokens = await tx.qrToken.deleteMany({
+        where: {
+          registrationId: id,
+        },
+      });
+
+      /*
+       * الحذف الحقيقي النهائي.
+       */
+      await tx.registration.delete({
+        where: {
+          id,
+        },
       });
 
       return {
-        archived: true,
-        qrRevoked: true,
-        registration: archivedRegistration,
+        offlineScans: offlineScans.count,
+        offlineMappings: offlineMappings.count,
+        digitalTicketImages: digitalTicketImages.count,
+        notificationLogs: notificationLogs.count,
+        importRows: importRows.count,
+        movements: movements.count,
+        rawScans: rawScans.count,
+        qrTokens: qrTokens.count,
       };
     });
+
+    return {
+      deleted: true,
+
+      registrationId: registration.id,
+      publicId: registration.publicId,
+
+      deletedRelations,
+    };
   }
 
   private async setStatus(id: string, status: RegistrationStatus) {
@@ -395,111 +423,6 @@ export class RegistrationsService {
 
     if (existingRegistration) {
       throw new ConflictException('Duplicate registration for this event');
-    }
-  }
-
-  private findArchivedRegistrationByPhone(eventId: string, phone: string) {
-    return this.prisma.registration.findFirst({
-      where: {
-        eventId,
-        phone,
-        status: RegistrationStatus.ARCHIVED,
-      },
-      select: {
-        id: true,
-        eventId: true,
-        phone: true,
-        status: true,
-      },
-    });
-  }
-
-  private async restoreArchivedRegistration(
-    registrationId: string,
-    dto: NormalizedCreateRegistrationDto,
-  ) {
-    const now = new Date();
-    const publicId = await this.generatePublicId();
-
-    try {
-      return await this.prisma.$transaction(async (tx) => {
-        /**
-         * إجراء احتياطي:
-         * لو بقي QR فعالًا لسبب ما، يتم إلغاؤه.
-         */
-        await tx.qrToken.updateMany({
-          where: {
-            registrationId,
-            status: QrTokenStatus.ACTIVE,
-          },
-          data: {
-            status: QrTokenStatus.REVOKED,
-            revokedAt: now,
-          },
-        });
-
-        /**
-         * updateMany مع status=ARCHIVED يمنع طلبين
-         * متزامنين من إعادة تفعيل السجل نفسه.
-         *
-         * أول طلب يحوله إلى ACTIVE.
-         * الطلب الثاني سيحصل على count = 0.
-         */
-        const restoreResult = await tx.registration.updateMany({
-          where: {
-            id: registrationId,
-            status: RegistrationStatus.ARCHIVED,
-          },
-          data: {
-            ...dto,
-
-            /**
-             * نعطي التسجيل Public ID جديدًا حتى
-             * لا تعمل روابط WhatsApp أو رموز التسجيل
-             * العامة القديمة بعد إعادة التسجيل.
-             */
-            publicId,
-
-            status: RegistrationStatus.ACTIVE,
-            registeredAt: now,
-
-            /**
-             * سيقوم PublicService بإنشاء طلب
-             * WhatsApp جديد بعد توليد البطاقة.
-             */
-            ticketRequestToken: null,
-            ticketRequestExpiresAt: null,
-            ticketRequestCreatedAt: null,
-            ticketRequestConsumedAt: null,
-
-            customFields:
-              dto.customFields === undefined
-                ? Prisma.JsonNull
-                : (dto.customFields as Prisma.InputJsonValue),
-          },
-        });
-
-        if (restoreResult.count !== 1) {
-          throw new ConflictException('Registration is no longer archived');
-        }
-
-        const restoredRegistration = await tx.registration.findUnique({
-          where: {
-            id: registrationId,
-          },
-        });
-
-        if (!restoredRegistration) {
-          throw new NotFoundException(
-            'Registration not found after restoration',
-          );
-        }
-
-        return restoredRegistration;
-      });
-    } catch (error) {
-      this.throwConflictForUniqueConstraint(error);
-      throw error;
     }
   }
 

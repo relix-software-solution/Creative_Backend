@@ -3,11 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import {
-  DeviceStatus,
-  OfflineKeyStatus,
-  Prisma,
-} from '@prisma/client';
+import { DeviceStatus, OfflineKeyStatus, Prisma } from '@prisma/client';
 import {
   createHash,
   createPublicKey,
@@ -17,19 +13,52 @@ import {
 import { PrismaService } from '../../database/prisma.service';
 
 export type OfflineQrPayload = {
-  v: 1;
+  /*
+   * V1: الصيغة القديمة على شكل Object.
+   * V2: الصيغة المختصرة الجديدة على شكل Array.
+   */
+  v: 1 | 2;
+
   type: 'OFFLINE_REGISTRATION';
+
   eventId: string;
   issuerDeviceId: string;
   issuerKeyVersion: number;
+
   offlineRegistrationOperationId: string;
+
+  /*
+   * موجود في V1 القديمة فقط.
+   */
   offlineRegistrationId?: string;
+
   offlineQrToken: string;
   attendeeTypeId: string;
+
+  /*
+   * موجود في V1 القديمة فقط.
+   */
   displayName?: string;
+
+  /*
+   * بعد قراءة V2 نحوّل Unix seconds إلى ISO،
+   * حتى يبقى باقي الباك يعمل دون تغيير.
+   */
   issuedAt: string;
   validUntil: string;
 };
+
+type CompactOfflineQrPayloadV2 = readonly [
+  version: 2,
+  eventId: string,
+  issuerDeviceId: string,
+  issuerKeyVersion: number,
+  offlineRegistrationOperationId: string,
+  offlineQrToken: string,
+  attendeeTypeId: string,
+  issuedAtSeconds: number,
+  validUntilSeconds: number,
+];
 
 export type VerifiedOfflineQr = {
   signedOfflineQr: string;
@@ -208,24 +237,36 @@ export class OfflineQrService {
 
   parseSignedOfflineQr(signedOfflineQr: string): VerifiedOfflineQr {
     const [encodedPayload, signature, extra] = signedOfflineQr.split('.');
+
     if (!encodedPayload || !signature || extra !== undefined) {
       throw new BadRequestException('Invalid offline QR token format');
     }
 
-    let payload: OfflineQrPayload;
+    let rawPayload: unknown;
+
     try {
-      payload = JSON.parse(
+      rawPayload = JSON.parse(
         Buffer.from(encodedPayload, 'base64url').toString('utf8'),
-      ) as OfflineQrPayload;
+      ) as unknown;
     } catch {
       throw new BadRequestException('Invalid offline QR payload encoding');
     }
+
+    /*
+     * نحول V1 القديمة وV2 الجديدة إلى نفس الشكل الداخلي.
+     * بذلك بقية ScansService والمزامنة لا تحتاج إلى تعديل.
+     */
+    const payload = this.normalizeOfflineQrPayload(rawPayload);
 
     return {
       signedOfflineQr,
       encodedPayload,
       signature,
       payload,
+
+      /*
+       * نحسب Hash من الشكل الموحّد.
+       */
       payloadHash: this.hashPayload(payload),
     };
   }
@@ -244,6 +285,109 @@ export class OfflineQrService {
     );
   }
 
+  private normalizeOfflineQrPayload(value: unknown): OfflineQrPayload {
+    /*
+     * الصيغة الجديدة المختصرة V2.
+     */
+    if (Array.isArray(value)) {
+      if (value.length !== 9) {
+        throw new BadRequestException(
+          'Invalid compact offline QR payload length',
+        );
+      }
+
+      const [
+        version,
+        eventId,
+        issuerDeviceId,
+        issuerKeyVersion,
+        offlineRegistrationOperationId,
+        offlineQrToken,
+        attendeeTypeId,
+        issuedAtSeconds,
+        validUntilSeconds,
+      ] = value as unknown as CompactOfflineQrPayloadV2;
+
+      if (version !== 2) {
+        throw new BadRequestException(
+          'Unsupported compact offline QR payload version',
+        );
+      }
+
+      const requiredStrings = [
+        eventId,
+        issuerDeviceId,
+        offlineRegistrationOperationId,
+        offlineQrToken,
+        attendeeTypeId,
+      ];
+
+      if (
+        requiredStrings.some(
+          (item) => typeof item !== 'string' || item.trim().length === 0,
+        )
+      ) {
+        throw new BadRequestException(
+          'Compact offline QR contains invalid identifiers',
+        );
+      }
+
+      if (!Number.isInteger(issuerKeyVersion) || issuerKeyVersion < 1) {
+        throw new BadRequestException(
+          'Compact offline QR key version is invalid',
+        );
+      }
+
+      if (
+        !Number.isInteger(issuedAtSeconds) ||
+        !Number.isInteger(validUntilSeconds) ||
+        issuedAtSeconds <= 0 ||
+        validUntilSeconds <= issuedAtSeconds
+      ) {
+        throw new BadRequestException(
+          'Compact offline QR timestamps are invalid',
+        );
+      }
+
+      const issuedAt = new Date(issuedAtSeconds * 1000);
+      const validUntil = new Date(validUntilSeconds * 1000);
+
+      if (
+        Number.isNaN(issuedAt.getTime()) ||
+        Number.isNaN(validUntil.getTime())
+      ) {
+        throw new BadRequestException('Compact offline QR dates are invalid');
+      }
+
+      return {
+        v: 2,
+        type: 'OFFLINE_REGISTRATION',
+
+        eventId,
+        issuerDeviceId,
+        issuerKeyVersion,
+
+        offlineRegistrationOperationId,
+
+        offlineQrToken,
+        attendeeTypeId,
+
+        issuedAt: issuedAt.toISOString(),
+        validUntil: validUntil.toISOString(),
+      };
+    }
+
+    /*
+     * الصيغة القديمة V1.
+     * لا نحذف دعمها لأن هناك Badges مطبوعة سابقًا.
+     */
+    if (!value || typeof value !== 'object') {
+      throw new BadRequestException('Invalid offline QR payload structure');
+    }
+
+    return value as OfflineQrPayload;
+  }
+
   private assertOfflineQrPayload(payload: OfflineQrPayload) {
     const requiredStrings: Array<keyof OfflineQrPayload> = [
       'type',
@@ -256,7 +400,10 @@ export class OfflineQrService {
       'validUntil',
     ];
 
-    if (payload.v !== 1 || payload.type !== 'OFFLINE_REGISTRATION') {
+    if (
+      (payload.v !== 1 && payload.v !== 2) ||
+      payload.type !== 'OFFLINE_REGISTRATION'
+    ) {
       throw new BadRequestException('Unsupported offline QR payload version');
     }
 
