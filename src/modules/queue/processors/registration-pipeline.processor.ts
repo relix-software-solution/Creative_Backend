@@ -12,6 +12,11 @@ type RegistrationCreatedJob = {
   registrationId: string;
   eventId: string;
   source: RegistrationSource;
+
+  /*
+   * true عندما أتى التسجيل من ImportsService.
+   */
+  skipDigitalTicket?: boolean;
 };
 
 @Processor(QUEUE_NAMES.REGISTRATION_PIPELINE)
@@ -68,6 +73,40 @@ export class RegistrationPipelineProcessor extends WorkerHost {
       qrToken: qr.qrToken,
     });
     await job.updateProgress(70);
+
+    /*
+     * نتجاوز Digital Ticket لكل تسجيل جاء من Import.
+     *
+     * فحص source موجود أيضًا لدعم Jobs قديمة تم وضعها
+     * في Redis قبل إضافة skipDigitalTicket.
+     */
+    const shouldSkipDigitalTicket =
+      job.data.skipDigitalTicket === true ||
+      job.data.source === RegistrationSource.EXCEL_IMPORT;
+
+    if (shouldSkipDigitalTicket) {
+      await job.updateProgress(100);
+
+      this.logger.log(
+        `Digital ticket skipped for imported registration=${registration.id}`,
+      );
+
+      return {
+        registrationId: registration.id,
+
+        /*
+         * QR وصورته تم توليدهما بشكل طبيعي.
+         */
+        qrGenerated: !hadQrToken,
+
+        ticketQueued: false,
+        ticketJobId: null,
+
+        whatsappQueued: false,
+
+        skippedReason: 'DIGITAL_TICKET_SKIPPED_FOR_IMPORT',
+      };
+    }
 
     const ticketJob = await this.enqueueDigitalTicketGeneration({
       registrationId: registration.id,
@@ -133,7 +172,9 @@ export class RegistrationPipelineProcessor extends WorkerHost {
 
       return {
         queued: false,
-        skippedReason: message.includes('Active digital ticket template not found')
+        skippedReason: message.includes(
+          'Active digital ticket template not found',
+        )
           ? 'DIGITAL_TICKET_TEMPLATE_NOT_FOUND'
           : 'DIGITAL_TICKET_ENQUEUE_FAILED',
       };

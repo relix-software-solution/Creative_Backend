@@ -68,6 +68,12 @@ export type CreateImportRegistrationOptions = {
   attendeeTypeIds?: ReadonlySet<string>;
   registrationFields?: RegistrationField[];
   enqueuePipeline?: boolean;
+
+  /*
+   * يستخدمه مسار Import فقط.
+   * يمنع Digital Ticket دون إيقاف توليد QR.
+   */
+  skipDigitalTicket?: boolean;
 };
 
 @Injectable()
@@ -337,6 +343,7 @@ export class RegistrationsService {
         registration.id,
         registration.eventId,
         registration.source,
+        options.skipDigitalTicket === true,
       );
     }
 
@@ -763,6 +770,7 @@ export class RegistrationsService {
     registrationId: string,
     eventId: string,
     source: RegistrationSource,
+    skipDigitalTicket = false,
   ) {
     if (
       !this.configService.get<boolean>('REGISTRATION_PIPELINE_ENABLED', true)
@@ -777,6 +785,7 @@ export class RegistrationsService {
           registrationId,
           eventId,
           source,
+          skipDigitalTicket,
         },
         {
           jobId: `registration-${registrationId}`,

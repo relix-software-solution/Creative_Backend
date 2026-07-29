@@ -433,9 +433,7 @@ export class ImportsService {
         typeof options.source === 'string'
           ? (options.source as RegistrationSource)
           : RegistrationSource.EXCEL_IMPORT,
-      duplicateStrategy: this.parseDuplicateStrategy(
-        options.duplicateStrategy,
-      ),
+      duplicateStrategy: this.parseDuplicateStrategy(options.duplicateStrategy),
       externalIdPrefix:
         typeof options.externalIdPrefix === 'string'
           ? options.externalIdPrefix
@@ -495,9 +493,7 @@ export class ImportsService {
 
     const where: Prisma.ImportJobWhereInput = {
       ...(query.eventId ? { eventId: query.eventId } : {}),
-      ...(query.attendeeTypeId
-        ? { attendeeTypeId: query.attendeeTypeId }
-        : {}),
+      ...(query.attendeeTypeId ? { attendeeTypeId: query.attendeeTypeId } : {}),
       ...(query.status ? { status: query.status } : {}),
     };
 
@@ -579,7 +575,13 @@ export class ImportsService {
             event: context.event,
             attendeeTypeIds: context.attendeeTypeIds,
             registrationFields: context.registrationFields,
+
+            /*
+             * يبقى Pipeline فعالًا لتوليد QR،
+             * لكن نتجاوز Digital Ticket لكل عمليات الاستيراد.
+             */
             enqueuePipeline: context.generateQr,
+            skipDigitalTicket: true,
           },
         );
 
@@ -595,9 +597,8 @@ export class ImportsService {
           throw error;
         }
 
-        const racedExisting = await this.findExistingRegistration(
-          normalizedData,
-        );
+        const racedExisting =
+          await this.findExistingRegistration(normalizedData);
 
         if (!racedExisting) {
           throw error;
@@ -766,10 +767,7 @@ export class ImportsService {
     });
   }
 
-  private async createJob(
-    command: ImportCommand,
-    rows: ParsedImportRow[],
-  ) {
+  private async createJob(command: ImportCommand, rows: ParsedImportRow[]) {
     const importJob = await this.prisma.importJob.create({
       data: {
         eventId: command.eventId,
@@ -824,8 +822,7 @@ export class ImportsService {
     context: ImportProcessingContext,
   ): Promise<CreateImportRegistrationInput> {
     const attendeeTypeId =
-      context.attendeeTypeId ??
-      this.resolveAttendeeTypeId(rawData, context);
+      context.attendeeTypeId ?? this.resolveAttendeeTypeId(rawData, context);
 
     const applicableFields = context.registrationFields.filter(
       (field) =>
@@ -838,7 +835,11 @@ export class ImportsService {
     for (const field of applicableFields) {
       const header =
         context.mapping.customFields?.[field.key] ??
-        this.findHeader(rawData, [field.key, field.labelAr, field.labelEn ?? '']);
+        this.findHeader(rawData, [
+          field.key,
+          field.labelAr,
+          field.labelEn ?? '',
+        ]);
 
       if (!header) {
         continue;
@@ -923,20 +924,16 @@ export class ImportsService {
           'الجهة',
         ],
       ),
-      jobTitle: this.getOptionalMappedValue(
-        rawData,
-        context.mapping.jobTitle,
-        [
-          'job_title',
-          'job title',
-          'position',
-          'title',
-          'occupation',
-          'المسمى الوظيفي',
-          'المنصب',
-          'الوظيفة',
-        ],
-      ),
+      jobTitle: this.getOptionalMappedValue(rawData, context.mapping.jobTitle, [
+        'job_title',
+        'job title',
+        'position',
+        'title',
+        'occupation',
+        'المسمى الوظيفي',
+        'المنصب',
+        'الوظيفة',
+      ]),
       externalId,
       notes: this.getOptionalMappedValue(rawData, context.mapping.notes, [
         'notes',
@@ -1061,7 +1058,11 @@ export class ImportsService {
     const detectedHeaderRow = this.detectHeaderRow(matrix);
     const headerRow = parser?.headerRow ?? detectedHeaderRow;
 
-    if (!Number.isInteger(headerRow) || headerRow < 1 || headerRow > matrix.length) {
+    if (
+      !Number.isInteger(headerRow) ||
+      headerRow < 1 ||
+      headerRow > matrix.length
+    ) {
       throw new BadRequestException('headerRow is invalid');
     }
 
@@ -1177,10 +1178,11 @@ export class ImportsService {
   }
 
   private detectCsvDelimiter(csvText: string) {
-    const sampleLine = csvText
-      .replace(/^\uFEFF/, '')
-      .split(/\r?\n/)
-      .find((line) => line.trim().length > 0) ?? '';
+    const sampleLine =
+      csvText
+        .replace(/^\uFEFF/, '')
+        .split(/\r?\n/)
+        .find((line) => line.trim().length > 0) ?? '';
 
     const candidates = [',', ';', '\t'];
 
@@ -1611,10 +1613,7 @@ export class ImportsService {
 
     if (input.attendeeTypeId) {
       for (const field of input.registrationFields) {
-        if (
-          field.isRequired &&
-          !input.mapping.customFields?.[field.key]
-        ) {
+        if (field.isRequired && !input.mapping.customFields?.[field.key]) {
           throw new BadRequestException(
             `Required custom field mapping is missing: ${field.key}`,
           );
@@ -1622,7 +1621,9 @@ export class ImportsService {
       }
     }
 
-    const fieldKeys = new Set(input.registrationFields.map((field) => field.key));
+    const fieldKeys = new Set(
+      input.registrationFields.map((field) => field.key),
+    );
 
     for (const fieldKey of Object.keys(input.mapping.customFields ?? {})) {
       if (!fieldKeys.has(fieldKey)) {
@@ -1663,9 +1664,7 @@ export class ImportsService {
     usedHeaders?: Set<string>,
   ) {
     const normalizedAliases = new Set(
-      aliases
-        .filter(Boolean)
-        .map((alias) => this.normalizeHeader(alias)),
+      aliases.filter(Boolean).map((alias) => this.normalizeHeader(alias)),
     );
 
     const exact = headers.find(
@@ -1949,11 +1948,7 @@ export class ImportsService {
   }
 
   private parseDuplicateStrategy(value: unknown): ImportDuplicateStrategy {
-    if (
-      value === 'FAIL' ||
-      value === 'UPDATE_EXISTING' ||
-      value === 'SKIP'
-    ) {
+    if (value === 'FAIL' || value === 'UPDATE_EXISTING' || value === 'SKIP') {
       return value;
     }
 
@@ -2004,11 +1999,7 @@ export class ImportsService {
         return response;
       }
 
-      if (
-        response &&
-        typeof response === 'object' &&
-        'message' in response
-      ) {
+      if (response && typeof response === 'object' && 'message' in response) {
         const message = (response as { message?: unknown }).message;
 
         if (Array.isArray(message)) {
@@ -2056,8 +2047,7 @@ export class ImportsService {
       'waiting',
       'delayed',
     );
-    let depth =
-      (initialCounts.waiting ?? 0) + (initialCounts.delayed ?? 0);
+    let depth = (initialCounts.waiting ?? 0) + (initialCounts.delayed ?? 0);
 
     if (depth < maxWaiting) {
       return;
