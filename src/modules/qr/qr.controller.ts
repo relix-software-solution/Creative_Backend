@@ -1,4 +1,12 @@
-import { Body, Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import type { FastifyRequest } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { Roles } from '../../common/decorators/roles.decorator';
@@ -66,6 +74,7 @@ export class QrController {
     const existingImage =
       await this.qrImageService.getRegistrationQrImageMetadata({
         registrationPublicId: qr.payload.registrationPublicId,
+        qrToken: qr.qrToken,
         requestBaseUrl: this.getRequestBaseUrl(request),
       });
     const image =

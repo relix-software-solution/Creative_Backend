@@ -1,6 +1,7 @@
+import { EventStatus, RegistrationSource } from '@prisma/client';
 import { ImportsService } from './imports.service';
 
-describe('ImportsService WhatsApp backpressure', () => {
+describe('ImportsService', () => {
   it('waits until WhatsApp queue depth reaches the resume threshold', async () => {
     const service = new ImportsService(
       {
@@ -25,29 +26,33 @@ describe('ImportsService WhatsApp backpressure', () => {
       {} as never,
       {} as never,
     );
+
     jest.spyOn(service as any, 'delay').mockResolvedValue(undefined);
 
     await (service as any).waitForWhatsAppBackpressure();
 
-    expect((service as any).whatsappNotificationsQueue.getJobCounts).toHaveBeenCalledTimes(3);
+    expect(
+      (service as any).whatsappNotificationsQueue.getJobCounts,
+    ).toHaveBeenCalledTimes(3);
   });
 
-  it('keeps import row output compact and asynchronous', async () => {
+  it('keeps import row output compact and uses the import-specific registration path', async () => {
     const prisma = {
-      registrationField: { findMany: jest.fn().mockResolvedValue([]) },
-      attendeeType: {
-        findFirst: jest.fn().mockResolvedValue({ id: 'attendee-1' }),
+      registration: {
+        findMany: jest.fn().mockResolvedValue([]),
       },
       importRow: {
         update: jest.fn().mockResolvedValue({}),
       },
     };
+
     const registrationsService = {
-      create: jest.fn().mockResolvedValue({
+      createFromImport: jest.fn().mockResolvedValue({
         id: 'registration-1',
         publicId: 'REG_IMPORT',
       }),
     };
+
     const service = new ImportsService(
       { get: jest.fn().mockReturnValue(false) } as never,
       {} as never,
@@ -61,23 +66,50 @@ describe('ImportsService WhatsApp backpressure', () => {
         {
           id: 'row-1',
           rawData: {
-            full_name: 'Import Visitor',
-            phone: '+963944000000',
+            Name: 'Import Visitor',
+            Phone: '',
           },
         } as never,
         {
+          event: {
+            id: 'event-1',
+            status: EventStatus.ACTIVE,
+            duplicateStrategy: 'PHONE',
+          } as never,
           eventId: 'event-1',
+          attendeeTypeId: 'attendee-1',
           generateQr: true,
-          source: 'EXCEL_IMPORT',
-        } as never,
+          source: RegistrationSource.EXCEL_IMPORT,
+          duplicateStrategy: 'SKIP',
+          mapping: {
+            fullName: 'Name',
+            phone: 'Phone',
+          },
+          registrationFields: [],
+          attendeeTypes: [],
+          attendeeTypesByCode: new Map(),
+          attendeeTypeIds: new Set(['attendee-1']),
+          defaultAttendeeTypeId: 'attendee-1',
+        },
       ),
     ).resolves.toBe('PROCESSED');
+
+    expect(registrationsService.createFromImport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fullName: 'Import Visitor',
+        phone: null,
+      }),
+      expect.objectContaining({
+        enqueuePipeline: true,
+      }),
+    );
 
     expect(prisma.importRow.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           normalizedData: expect.objectContaining({
             output: {
+              action: 'CREATED',
               registrationId: 'registration-1',
               publicId: 'REG_IMPORT',
             },
@@ -85,6 +117,7 @@ describe('ImportsService WhatsApp backpressure', () => {
         }),
       }),
     );
+
     expect(JSON.stringify(prisma.importRow.update.mock.calls)).not.toContain(
       'digitalTicket',
     );

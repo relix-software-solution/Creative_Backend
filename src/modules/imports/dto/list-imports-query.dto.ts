@@ -8,6 +8,10 @@ export class ListImportsQueryDto extends PaginationQueryDto {
   eventId?: string;
 
   @IsOptional()
+  @IsString()
+  attendeeTypeId?: string;
+
+  @IsOptional()
   @IsEnum(ImportJobStatus)
   status?: ImportJobStatus;
 }

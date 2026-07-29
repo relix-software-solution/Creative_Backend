@@ -238,18 +238,20 @@ enum StaffScanMode {
 }
 
 model Client {
-  id           String   @id @default(cuid())
-  name         String
-  contactName  String?
-  contactPhone String?
-  contactEmail String?
-  notes        String?  @db.Text
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id            String   @id @default(cuid())
+  name          String
+  contactName   String?
+  contactPhone  String?
+  contactEmail  String?
+  notes         String?  @db.Text
+  isActive      Boolean  @default(true)
+  primaryUserId String?  @unique
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
-  events Event[]
-  users  User[]
+  events      Event[]
+  users       User[]  @relation("ClientUsers")
+  primaryUser User?   @relation("ClientPrimaryUser", fields: [primaryUserId], references: [id], onDelete: SetNull)
 
   @@index([name])
   @@index([isActive])
@@ -269,7 +271,8 @@ model User {
   updatedAt    DateTime   @updatedAt
   deletedAt    DateTime?
 
-  client           Client?           @relation(fields: [clientId], references: [id])
+  client           Client?           @relation("ClientUsers", fields: [clientId], references: [id])
+  primaryForClient Client?           @relation("ClientPrimaryUser")
   createdAuditLogs AuditLog[]
   refreshTokens    RefreshToken[]
   staffAssignments StaffAssignment[]
@@ -614,30 +617,30 @@ model RegistrationField {
 }
 
 model Registration {
-  id             String             @id @default(cuid())
-  publicId       String             @unique
-  eventId        String
-  attendeeTypeId String
-  status         RegistrationStatus @default(ACTIVE)
-  source         RegistrationSource @default(ADMIN)
-  fullName       String
-  phone          String?
-  email          String?
-  companyName    String?
-  jobTitle       String?
-  externalId     String?
-  customFields   Json?
-  notes          String?            @db.Text
-  ticketRequestToken     String?    @unique
-  ticketRequestExpiresAt DateTime?
-  ticketRequestCreatedAt DateTime?
+  id                      String             @id @default(cuid())
+  publicId                String             @unique
+  eventId                 String
+  attendeeTypeId          String
+  status                  RegistrationStatus @default(ACTIVE)
+  source                  RegistrationSource @default(ADMIN)
+  fullName                String
+  phone                   String?
+  email                   String?
+  companyName             String?
+  jobTitle                String?
+  externalId              String?
+  customFields            Json?
+  notes                   String?            @db.Text
+  ticketRequestToken      String?            @unique
+  ticketRequestExpiresAt  DateTime?
+  ticketRequestCreatedAt  DateTime?
   ticketRequestConsumedAt DateTime?
-  ticketRequestPhone       String?
-  ticketRequestClaimedAt   DateTime? 
-  registeredAt   DateTime           @default(now())
-  syncedAt       DateTime?
-  createdAt      DateTime           @default(now())
-  updatedAt      DateTime           @updatedAt
+  ticketRequestPhone      String?
+  ticketRequestClaimedAt  DateTime?
+  registeredAt            DateTime           @default(now())
+  syncedAt                DateTime?
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
 
   event                       Event                        @relation(fields: [eventId], references: [id])
   attendeeType                AttendeeType                 @relation(fields: [attendeeTypeId], references: [id])
@@ -665,7 +668,7 @@ model Registration {
   @@index([registeredAt])
   @@index([createdAt])
   @@index([ticketRequestPhone])
-   @@index([eventId, updatedAt, id])
+  @@index([eventId, updatedAt, id])
 }
 
 model WebhookDelivery {
@@ -1137,5 +1140,3 @@ model AuditLog {
   @@index([entityId])
   @@index([createdAt])
 }
-
-

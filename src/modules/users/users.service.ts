@@ -34,6 +34,36 @@ export class UsersService {
     });
   }
 
+  findAuthUserById(id: string) {
+    return this.prisma.user.findUnique({
+      where: { id },
+      include: {
+        client: {
+          select: {
+            id: true,
+            isActive: true,
+          },
+        },
+      },
+    });
+  }
+
+  findAuthUserByEmailOrPhone(identifier: string) {
+    return this.prisma.user.findFirst({
+      where: {
+        OR: [{ email: identifier }, { phone: identifier }],
+      },
+      include: {
+        client: {
+          select: {
+            id: true,
+            isActive: true,
+          },
+        },
+      },
+    });
+  }
+
   async create(createUserDto: CreateUserDto) {
     this.ensureEmailOrPhone(createUserDto.email, createUserDto.phone);
     await this.ensureEmailAndPhoneAreUnique(
@@ -117,7 +147,9 @@ export class UsersService {
     const role = updateUserDto.role ?? user.role;
     const clientId = await this.resolveClientIdForRole(
       role,
-      updateUserDto.clientId === undefined ? user.clientId : updateUserDto.clientId,
+      updateUserDto.clientId === undefined
+        ? user.clientId
+        : updateUserDto.clientId,
     );
     const updatedUser = await this.prisma.user.update({
       where: { id },
@@ -236,10 +268,7 @@ export class UsersService {
     const existingUser = await this.prisma.user.findFirst({
       where: {
         ...(excludeId ? { id: { not: excludeId } } : {}),
-        OR: [
-          ...(email ? [{ email }] : []),
-          ...(phone ? [{ phone }] : []),
-        ],
+        OR: [...(email ? [{ email }] : []), ...(phone ? [{ phone }] : [])],
       },
     });
 

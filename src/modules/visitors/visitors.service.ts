@@ -42,6 +42,74 @@ export class VisitorsService {
     private readonly registrationsService: RegistrationsService,
   ) {}
 
+  async getOfflineStateForStaff(userId: string, requestBaseUrl?: string) {
+    const assignment = await this.findActiveStaffAssignment(userId);
+
+    const [badgeTemplate, visitorsAggregate] = await Promise.all([
+      this.badgeTemplatesService.findActiveTemplateOrNull(assignment.eventId),
+
+      this.prisma.registration.aggregate({
+        where: {
+          eventId: assignment.eventId,
+        },
+
+        _count: {
+          _all: true,
+        },
+
+        _max: {
+          updatedAt: true,
+        },
+      }),
+    ]);
+
+    const visitorsCount = visitorsAggregate._count._all;
+
+    const visitorsUpdatedAt =
+      visitorsAggregate._max.updatedAt?.toISOString() ?? null;
+
+    /*
+     * يتغير عند:
+     * - إنشاء زائر.
+     * - تعديل زائر.
+     * - حذف زائر.
+     *
+     * count يكشف الإنشاء والحذف،
+     * updatedAt يكشف التعديلات.
+     */
+    const visitorsRevision = [
+      assignment.eventId,
+      visitorsCount,
+      visitorsUpdatedAt ?? 'EMPTY',
+    ].join(':');
+
+    const formattedBadgeTemplate = this.formatOfflineBadgeTemplate(
+      badgeTemplate,
+      requestBaseUrl,
+    );
+
+    const badgeTemplateRevision = badgeTemplate
+      ? [
+          badgeTemplate.id,
+          badgeTemplate.updatedAt.toISOString(),
+          badgeTemplate.isActive ? 'ACTIVE' : 'INACTIVE',
+        ].join(':')
+      : 'NO_BADGE_TEMPLATE';
+
+    return {
+      eventId: assignment.eventId,
+
+      visitorsRevision,
+      visitorsCount,
+      visitorsUpdatedAt,
+
+      badgeTemplateRevision,
+      badgeTemplate: formattedBadgeTemplate,
+
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
   /**
    * Snapshot ثابت لجميع زوار فعالية الموظف.
    *
@@ -692,6 +760,12 @@ export class VisitorsService {
       const existingImage =
         await this.qrImageService.getRegistrationQrImageMetadata({
           registrationPublicId: visitor.publicId,
+
+          /*
+           * مهم حتى يختار الصورة الخاصة بنفس التوكن.
+           */
+          qrToken: qr.qrToken,
+
           requestBaseUrl,
         });
 
@@ -941,10 +1015,6 @@ export class VisitorsService {
         qrToken.tokenId,
       );
     } catch (error) {
-      /*
-       * لا نفشل تنزيل 50 ألف زائر بسبب Payload واحد قديم أو تالف.
-       * يبقى Compact QR متاحًا لهذا السجل.
-       */
       this.logger.warn(
         `Could not reconstruct signed QR for token ${qrToken.tokenId}: ${
           error instanceof Error ? error.message : 'Unknown QR payload error'
@@ -952,28 +1022,29 @@ export class VisitorsService {
       );
     }
 
-    const primaryQrToken = signedQrToken || compactQrToken;
-
     return {
       id: qrToken.id,
       tokenId: qrToken.tokenId,
 
       /*
-       * الرمز الأساسي هو Full Signed QR نفسه المطبوع على البادج.
+       * الرمز الأساسي للطباعة والمسح.
        */
-      qrToken: primaryQrToken,
-      token: primaryQrToken,
-      value: primaryQrToken,
+      qrToken: compactQrToken,
+      token: compactQrToken,
+      value: compactQrToken,
 
       /*
-       * نخزن النوعين داخل IndexedDB.
+       * الاحتفاظ بالرمز الكامل للتوافق والتحقق،
+       * لكنه ليس الرمز المستخدم في صورة QR.
        */
       signedToken: signedQrToken,
       compactQrToken,
 
       status: qrToken.status,
+
       validFrom: qrToken.validFrom,
       validUntil: qrToken.validUntil,
+
       generatedAt: qrToken.generatedAt,
       updatedAt: qrToken.updatedAt,
 

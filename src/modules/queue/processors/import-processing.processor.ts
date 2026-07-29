@@ -15,9 +15,11 @@ export class ImportProcessingProcessor extends WorkerHost {
 
   async process(job: Job<ImportProcessJob>) {
     await job.updateProgress(5);
+
     const importJob = await this.importsService.processImportJob(
       job.data.importJobId,
     );
+
     await job.updateProgress(100);
 
     return {

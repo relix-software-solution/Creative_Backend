@@ -1,13 +1,13 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { UserStatus } from '@prisma/client';
 import { comparePassword } from '../../common/utils/password.util';
 import { PrismaService } from '../../database/prisma.service';
 import { UsersService } from '../users/users.service';
 import { AuthUser } from './types/auth-user.type';
 import { JwtPayload } from './types/jwt-payload.type';
 import { hashRefreshToken } from './utils/refresh-token.util';
+import { isAuthenticationAllowed } from './utils/is-authentication-allowed.util';
 
 const REFRESH_TOKEN_EXPIRES_IN_DAYS = 7;
 
@@ -24,9 +24,15 @@ export class AuthService {
     identifier: string,
     password: string,
   ): Promise<AuthUser> {
-    const user = await this.usersService.findByEmailOrPhone(identifier);
+    const user = await this.usersService.findAuthUserByEmailOrPhone(identifier);
 
-    if (!user || user.status !== UserStatus.ACTIVE) {
+    /*
+     * نحافظ على نفس الرسالة حتى لا نكشف هل:
+     * - المستخدم غير موجود
+     * - المستخدم موقوف
+     * - العميل معطل
+     */
+    if (!user || !isAuthenticationAllowed(user)) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
@@ -55,6 +61,7 @@ export class AuthService {
     });
 
     const { accessToken, refreshToken } = await this.issueTokens(user);
+
     await this.storeRefreshToken(user.id, refreshToken);
 
     return {
@@ -67,9 +74,11 @@ export class AuthService {
   async refresh(refreshToken: string) {
     const payload = await this.verifyRefreshToken(refreshToken);
     const tokenHash = hashRefreshToken(refreshToken);
+
     const storedRefreshToken = await this.prisma.refreshToken.findUnique({
       where: { tokenHash },
     });
+
     const now = new Date();
 
     if (
@@ -81,9 +90,9 @@ export class AuthService {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    const userRecord = await this.usersService.findById(payload.sub);
+    const userRecord = await this.usersService.findAuthUserById(payload.sub);
 
-    if (!userRecord || userRecord.status !== UserStatus.ACTIVE) {
+    if (!userRecord || !isAuthenticationAllowed(userRecord)) {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
@@ -95,6 +104,7 @@ export class AuthService {
       role: userRecord.role,
       clientId: userRecord.clientId,
     };
+
     const tokens = await this.issueTokens(user);
 
     await this.prisma.$transaction([
@@ -120,6 +130,7 @@ export class AuthService {
 
   async logout(refreshToken: string) {
     const tokenHash = hashRefreshToken(refreshToken);
+
     const storedRefreshToken = await this.prisma.refreshToken.findUnique({
       where: { tokenHash },
     });
@@ -135,9 +146,9 @@ export class AuthService {
   }
 
   async me(userId: string): Promise<AuthUser> {
-    const user = await this.usersService.findById(userId);
+    const user = await this.usersService.findAuthUserById(userId);
 
-    if (!user || user.status !== UserStatus.ACTIVE) {
+    if (!user || !isAuthenticationAllowed(user)) {
       throw new UnauthorizedException('Invalid token');
     }
 
@@ -194,6 +205,7 @@ export class AuthService {
 
   private getRefreshTokenExpiresAt(): Date {
     const expiresAt = new Date();
+
     expiresAt.setDate(expiresAt.getDate() + REFRESH_TOKEN_EXPIRES_IN_DAYS);
 
     return expiresAt;

@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHash } from 'crypto';
 import { access, mkdir } from 'fs/promises';
 import { join } from 'path';
 import QRCode from 'qrcode';
@@ -10,56 +11,83 @@ type GenerateRegistrationQrImageInput = {
   requestBaseUrl?: string;
 };
 
+type GetRegistrationQrImageMetadataInput = {
+  registrationPublicId: string;
+  qrToken?: string;
+  requestBaseUrl?: string;
+};
+
 @Injectable()
 export class QrImageService {
   constructor(private readonly configService: ConfigService) {}
 
   async generateRegistrationQrImage(input: GenerateRegistrationQrImageInput) {
-    const filename = `${this.sanitizeFilename(
+    const filename = this.buildQrFilename(
       input.registrationPublicId,
-    )}.png`;
+      input.qrToken,
+    );
+
     const outputDir = join(this.uploadRoot, 'qr');
     const filePath = join(outputDir, filename);
 
-    await mkdir(outputDir, { recursive: true });
+    await mkdir(outputDir, {
+      recursive: true,
+    });
 
-    /*
-     * M is intentionally used instead of H.
-     *
-     * The Digital Ticket uses the short compact signed token, so M provides
-     * a better balance:
-     * - fewer QR modules
-     * - larger visual pixels/modules
-     * - faster scanning at exhibition gates
-     * - sufficient correction for clean phone screens and printed tickets
-     */
-    await QRCode.toFile(filePath, input.qrToken, {
+    await QRCode.toFile(filePath, input.qrToken.trim(), {
       type: 'png',
-      errorCorrectionLevel: 'M',
+
+      /*
+       * L تعطي أقل Error Correction،
+       * وقد تساعد بالحصول على QR أخف عندما يكون طول
+       * المحتوى قريبًا من حدود إصدارات QR.
+       */
+      errorCorrectionLevel: 'L',
+
+      /*
+       * Quiet Zone قياسية.
+       */
       margin: 4,
+
+      /*
+       * دقة الصورة وليست كثافة المعلومات.
+       */
       width: 1024,
+
       color: {
         dark: '#000000',
         light: '#FFFFFF',
       },
     });
 
+    const relativePath = `/uploads/qr/${filename}`;
+
     return {
       filePath,
-      relativePath: `/uploads/qr/${filename}`,
-      publicUrl: `${this.resolveBaseUrl(
-        input.requestBaseUrl,
-      )}/uploads/qr/${filename}`,
+
+      relativePath,
+
+      publicUrl: `${this.resolveBaseUrl(input.requestBaseUrl)}${relativePath}`,
     };
   }
 
-  async getRegistrationQrImageMetadata(input: {
-    registrationPublicId: string;
-    requestBaseUrl?: string;
-  }) {
-    const filename = `${this.sanitizeFilename(
-      input.registrationPublicId,
-    )}.png`;
+  async getRegistrationQrImageMetadata(
+    input: GetRegistrationQrImageMetadataInput,
+  ) {
+    const qrToken = input.qrToken?.trim();
+
+    /*
+     * بعض الاستدعاءات القديمة لا ترسل qrToken.
+     *
+     * عندها لا نستخدم صورة قديمة، بل نرجع null
+     * حتى يتم توليد صورة جديدة من التوكن المختصر.
+     */
+    if (!qrToken) {
+      return null;
+    }
+
+    const filename = this.buildQrFilename(input.registrationPublicId, qrToken);
+
     const filePath = join(this.uploadRoot, 'qr', filename);
 
     try {
@@ -68,13 +96,32 @@ export class QrImageService {
       return null;
     }
 
+    const relativePath = `/uploads/qr/${filename}`;
+
     return {
       filePath,
-      relativePath: `/uploads/qr/${filename}`,
-      publicUrl: `${this.resolveBaseUrl(
-        input.requestBaseUrl,
-      )}/uploads/qr/${filename}`,
+
+      relativePath,
+
+      publicUrl: `${this.resolveBaseUrl(input.requestBaseUrl)}${relativePath}`,
     };
+  }
+
+  private buildQrFilename(registrationPublicId: string, qrToken: string) {
+    const publicId = this.sanitizeFilename(registrationPublicId);
+
+    /*
+     * عند تغير التوكن يتغير اسم الصورة.
+     *
+     * هذا يمنع إعادة استخدام PNG قديمة مولدة
+     * من Full Signed QR الكثيف.
+     */
+    const tokenFingerprint = createHash('sha256')
+      .update(qrToken.trim(), 'utf8')
+      .digest('hex')
+      .slice(0, 16);
+
+    return `${publicId}-${tokenFingerprint}.png`;
   }
 
   private sanitizeFilename(value: string) {

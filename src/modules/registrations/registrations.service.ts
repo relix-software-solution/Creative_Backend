@@ -12,7 +12,6 @@ import {
   Event,
   EventStatus,
   Prisma,
-  QrTokenStatus,
   Registration,
   RegistrationField,
   RegistrationFieldType,
@@ -36,13 +35,23 @@ type RegistrationInput = Pick<
   'eventId' | 'attendeeTypeId' | 'phone' | 'email' | 'externalId'
 >;
 
-type NormalizedCreateRegistrationDto = Omit<
+export type CreateImportRegistrationInput = Omit<
   CreateRegistrationDto,
-  'fullName' | 'phone' | 'email'
+  'phone' | 'email' | 'source'
+> & {
+  phone?: string | null;
+  email?: string | null;
+  source?: RegistrationSource;
+};
+
+type NormalizedCreateRegistrationDto = Omit<
+  CreateImportRegistrationInput,
+  'fullName' | 'phone' | 'email' | 'source'
 > & {
   fullName: string;
-  phone: string;
+  phone: string | null;
   email: string | null;
+  source: RegistrationSource;
 };
 
 type NormalizedUpdateRegistrationDto = Omit<
@@ -52,6 +61,13 @@ type NormalizedUpdateRegistrationDto = Omit<
   fullName?: string;
   phone?: string;
   email?: string | null;
+};
+
+export type CreateImportRegistrationOptions = {
+  event?: Event;
+  attendeeTypeIds?: ReadonlySet<string>;
+  registrationFields?: RegistrationField[];
+  enqueuePipeline?: boolean;
 };
 
 @Injectable()
@@ -68,37 +84,25 @@ export class RegistrationsService {
   async create(createRegistrationDto: CreateRegistrationDto) {
     const dto = this.normalizeCreateDto(createRegistrationDto);
 
-    const event = await this.ensureEventCanBeModified(dto.eventId);
+    return this.createNormalized(dto, {
+      enqueuePipeline: true,
+    });
+  }
 
-    await this.ensureAttendeeTypeCanBeUsed(dto.attendeeTypeId, dto.eventId);
+  /**
+   * مسار داخلي مخصص للاستيراد.
+   *
+   * يختلف عن create العادي بنقطة واحدة أساسية:
+   * الهاتف يمكن أن يكون null لأن بعض ملفات الجهات لا تحتوي رقم هاتف.
+   * بقية التحقق من الفعالية ونوع الحضور والحقول الديناميكية والتكرار يبقى فعالًا.
+   */
+  async createFromImport(
+    input: CreateImportRegistrationInput,
+    options: CreateImportRegistrationOptions = {},
+  ) {
+    const dto = this.normalizeImportCreateDto(input);
 
-    const registrationInput: RegistrationInput = {
-      eventId: dto.eventId,
-      attendeeTypeId: dto.attendeeTypeId,
-
-      phone: dto.phone,
-      email: dto.email,
-
-      externalId: dto.externalId ?? null,
-    };
-
-    await this.ensureDuplicateAllowed(event, registrationInput);
-
-    await this.validateCustomFields(
-      dto.eventId,
-      dto.attendeeTypeId,
-      dto.customFields ?? {},
-    );
-
-    const registration = await this.createRegistrationOrThrowConflict(dto);
-
-    void this.enqueueRegistrationPipeline(
-      registration.id,
-      registration.eventId,
-      registration.source,
-    );
-
-    return registration;
+    return this.createNormalized(dto, options);
   }
 
   async findAll(query: ListRegistrationsQueryDto) {
@@ -169,12 +173,14 @@ export class RegistrationsService {
       externalId:
         dto.externalId === undefined ? registration.externalId : dto.externalId,
     };
+
     await this.ensureDuplicateAllowed(event, nextRegistration, id);
 
     const customFields =
       dto.customFields === undefined
         ? this.toRecord(registration.customFields)
         : dto.customFields;
+
     await this.validateCustomFields(
       registration.eventId,
       attendeeTypeId,
@@ -218,63 +224,36 @@ export class RegistrationsService {
     await this.ensureEventCanBeModified(registration.eventId);
 
     const deletedRelations = await this.prisma.$transaction(async (tx) => {
-      /*
-       * الترتيب مهم بسبب العلاقات والمفاتيح الأجنبية.
-       *
-       * OfflineScanOperation قد يرتبط بـ:
-       * - Registration
-       * - MovementLog
-       * - ScanEventRaw
-       *
-       * لذلك يُحذف أولًا.
-       */
       const offlineScans = await tx.offlineScanOperation.deleteMany({
         where: {
           registrationId: id,
         },
       });
 
-      /*
-       * Mapping يرتبط بالتسجيل وبـQR الرسمي.
-       */
       const offlineMappings = await tx.offlineRegistrationMapping.deleteMany({
         where: {
           registrationId: id,
         },
       });
 
-      /*
-       * صور التذاكر الرقمية المسجلة في قاعدة البيانات.
-       */
       const digitalTicketImages = await tx.digitalTicketImage.deleteMany({
         where: {
           registrationId: id,
         },
       });
 
-      /*
-       * نحذف سجلات الإشعارات المرتبطة بالزائر.
-       */
       const notificationLogs = await tx.notificationLog.deleteMany({
         where: {
           registrationId: id,
         },
       });
 
-      /*
-       * بما أنك تريد حذفًا كاملًا، نحذف ImportRow المرتبط
-       * بدل إبقائه مرتبطًا بسجل لم يعد موجودًا.
-       */
       const importRows = await tx.importRow.deleteMany({
         where: {
           registrationId: id,
         },
       });
 
-      /*
-       * MovementLog يعتمد على ScanEventRaw،
-       * لذلك يجب حذف الحركات قبل السكانات الخام.
-       */
       const movements = await tx.movementLog.deleteMany({
         where: {
           registrationId: id,
@@ -287,18 +266,12 @@ export class RegistrationsService {
         },
       });
 
-      /*
-       * بعد حذف السكانات والحركات يمكن حذف QR.
-       */
       const qrTokens = await tx.qrToken.deleteMany({
         where: {
           registrationId: id,
         },
       });
 
-      /*
-       * الحذف الحقيقي النهائي.
-       */
       await tx.registration.delete({
         where: {
           id,
@@ -319,12 +292,55 @@ export class RegistrationsService {
 
     return {
       deleted: true,
-
       registrationId: registration.id,
       publicId: registration.publicId,
-
       deletedRelations,
     };
+  }
+
+  private async createNormalized(
+    dto: NormalizedCreateRegistrationDto,
+    options: CreateImportRegistrationOptions,
+  ) {
+    const event =
+      options.event ?? (await this.ensureEventCanBeModified(dto.eventId));
+
+    if (event.id !== dto.eventId) {
+      throw new BadRequestException('Event validation context mismatch');
+    }
+
+    if (!options.attendeeTypeIds?.has(dto.attendeeTypeId)) {
+      await this.ensureAttendeeTypeCanBeUsed(dto.attendeeTypeId, dto.eventId);
+    }
+
+    const registrationInput: RegistrationInput = {
+      eventId: dto.eventId,
+      attendeeTypeId: dto.attendeeTypeId,
+      phone: dto.phone,
+      email: dto.email,
+      externalId: dto.externalId ?? null,
+    };
+
+    await this.ensureDuplicateAllowed(event, registrationInput);
+
+    await this.validateCustomFields(
+      dto.eventId,
+      dto.attendeeTypeId,
+      dto.customFields ?? {},
+      options.registrationFields,
+    );
+
+    const registration = await this.createRegistrationOrThrowConflict(dto);
+
+    if (options.enqueuePipeline !== false) {
+      void this.enqueueRegistrationPipeline(
+        registration.id,
+        registration.eventId,
+        registration.source,
+      );
+    }
+
+    return registration;
   }
 
   private async setStatus(id: string, status: RegistrationStatus) {
@@ -461,6 +477,23 @@ export class RegistrationsService {
       jobTitle: this.normalizeOptionalString(dto.jobTitle),
       externalId: this.normalizeOptionalString(dto.externalId),
       notes: this.normalizeOptionalString(dto.notes),
+      source: dto.source ?? RegistrationSource.ADMIN,
+    };
+  }
+
+  private normalizeImportCreateDto(
+    dto: CreateImportRegistrationInput,
+  ): NormalizedCreateRegistrationDto {
+    return {
+      ...dto,
+      fullName: this.normalizeRequiredString(dto.fullName, 'fullName'),
+      phone: this.normalizeOptionalPhoneToNull(dto.phone),
+      email: this.normalizeOptionalStringToNull(dto.email),
+      companyName: this.normalizeOptionalString(dto.companyName),
+      jobTitle: this.normalizeOptionalString(dto.jobTitle),
+      externalId: this.normalizeOptionalString(dto.externalId),
+      notes: this.normalizeOptionalString(dto.notes),
+      source: dto.source ?? RegistrationSource.EXCEL_IMPORT,
     };
   }
 
@@ -494,6 +527,28 @@ export class RegistrationsService {
     }
 
     return value.trim();
+  }
+
+  private normalizeOptionalPhoneToNull(value: unknown) {
+    if (value === undefined || value === null) {
+      return null;
+    }
+
+    if (typeof value !== 'string') {
+      throw new BadRequestException('phone must be a string');
+    }
+
+    const trimmed = value.trim();
+
+    if (trimmed.length === 0) {
+      return null;
+    }
+
+    if (trimmed.length > 50) {
+      throw new BadRequestException('phone is too long');
+    }
+
+    return trimmed;
   }
 
   private normalizeOptionalString(value: unknown) {
@@ -545,14 +600,24 @@ export class RegistrationsService {
     eventId: string,
     attendeeTypeId: string,
     customFields: Record<string, unknown>,
+    preloadedFields?: RegistrationField[],
   ) {
-    const fields = await this.prisma.registrationField.findMany({
-      where: {
-        eventId,
-        isActive: true,
-        OR: [{ attendeeTypeId: null }, { attendeeTypeId }],
-      },
-    });
+    const fields = preloadedFields
+      ? preloadedFields.filter(
+          (field) =>
+            field.eventId === eventId &&
+            field.isActive &&
+            (field.attendeeTypeId === null ||
+              field.attendeeTypeId === attendeeTypeId),
+        )
+      : await this.prisma.registrationField.findMany({
+          where: {
+            eventId,
+            isActive: true,
+            OR: [{ attendeeTypeId: null }, { attendeeTypeId }],
+          },
+        });
+
     const fieldsByKey = new Map(fields.map((field) => [field.key, field]));
 
     for (const key of Object.keys(customFields)) {
@@ -714,6 +779,7 @@ export class RegistrationsService {
           source,
         },
         {
+          jobId: `registration-${registrationId}`,
           attempts: 3,
           backoff: {
             type: 'exponential',

@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  Header,
   Param,
   Patch,
   Query,
@@ -33,6 +34,7 @@ export class StaffVisitorsController {
    * GET /api/v1/staff/visitors/offline-snapshot?cursor=...&limit=500
    */
   @Get('offline-snapshot')
+  @Header('Cache-Control', 'no-store, no-cache, must-revalidate')
   getOfflineSnapshot(
     @CurrentUser() user: AuthUser,
     @Query() query: StaffOfflineSnapshotQueryDto,
@@ -41,6 +43,18 @@ export class StaffVisitorsController {
     return this.visitorsService.findOfflineSnapshotForStaff(
       user.id,
       query,
+      this.getRequestBaseUrl(request),
+    );
+  }
+
+  @Get('offline-state')
+  @Header('Cache-Control', 'no-store, no-cache, must-revalidate')
+  getOfflineState(
+    @CurrentUser() user: AuthUser,
+    @Req() request: FastifyRequest,
+  ) {
+    return this.visitorsService.getOfflineStateForStaff(
+      user.id,
       this.getRequestBaseUrl(request),
     );
   }

@@ -16,7 +16,14 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import type { AuthUser } from '../auth/types/auth-user.type';
 import { ListImportRowsQueryDto } from './dto/list-import-rows-query.dto';
 import { ListImportsQueryDto } from './dto/list-imports-query.dto';
-import { ImportsService } from './imports.service';
+import {
+  ImportDuplicateStrategy,
+  ImportFileParserOptions,
+  ImportMapping,
+  ImportsService,
+} from './imports.service';
+
+const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024;
 
 type MultipartField = { value?: unknown };
 type MultipartRequest = {
@@ -34,6 +41,30 @@ type MultipartRequest = {
 export class ImportsController {
   constructor(private readonly importsService: ImportsService) {}
 
+  @Post('registrations/preview')
+  async previewRegistrations(@Req() request: MultipartRequest) {
+    const uploadedFile = await request.file();
+
+    if (!uploadedFile) {
+      throw new BadRequestException('File is required');
+    }
+
+    const buffer = await this.readFileWithLimit(uploadedFile.file);
+    const fields = uploadedFile.fields;
+
+    return this.importsService.previewRegistrations({
+      file: {
+        buffer,
+        filename: uploadedFile.filename,
+        mimetype: uploadedFile.mimetype,
+        size: buffer.length,
+      },
+      eventId: this.getRequiredField(fields, 'eventId'),
+      attendeeTypeId: this.getOptionalField(fields, 'attendeeTypeId'),
+      parser: this.getParserOptions(fields),
+    });
+  }
+
   @Post('registrations')
   async importRegistrations(
     @Req() request: MultipartRequest,
@@ -45,7 +76,7 @@ export class ImportsController {
       throw new BadRequestException('File is required');
     }
 
-    const buffer = Buffer.concat(await this.readChunks(uploadedFile.file));
+    const buffer = await this.readFileWithLimit(uploadedFile.file);
     const fields = uploadedFile.fields;
 
     return this.importsService.importRegistrations({
@@ -57,11 +88,12 @@ export class ImportsController {
       },
       eventId: this.getRequiredField(fields, 'eventId'),
       attendeeTypeId: this.getOptionalField(fields, 'attendeeTypeId'),
-      generateQr: this.getBooleanField(fields, 'generateQr'),
-      source:
-        (this.getOptionalField(fields, 'source') as RegistrationSource) ??
-        RegistrationSource.EXCEL_IMPORT,
+      generateQr: this.getBooleanField(fields, 'generateQr', true),
+      source: this.getRegistrationSource(fields),
+      duplicateStrategy: this.getDuplicateStrategy(fields),
+      externalIdPrefix: this.getOptionalField(fields, 'externalIdPrefix'),
       mapping: this.parseMapping(this.getOptionalField(fields, 'mapping')),
+      parser: this.getParserOptions(fields),
       uploadedByUserId: user.id,
     });
   }
@@ -81,14 +113,25 @@ export class ImportsController {
     return this.importsService.findRows(id, query);
   }
 
-  private async readChunks(file: AsyncIterable<Buffer>) {
+  private async readFileWithLimit(file: AsyncIterable<Buffer>) {
     const chunks: Buffer[] = [];
+    let totalBytes = 0;
 
-    for await (const chunk of file) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    for await (const chunkValue of file) {
+      const chunk = Buffer.isBuffer(chunkValue)
+        ? chunkValue
+        : Buffer.from(chunkValue);
+
+      totalBytes += chunk.length;
+
+      if (totalBytes > MAX_FILE_SIZE_BYTES) {
+        throw new BadRequestException('File is too large');
+      }
+
+      chunks.push(chunk);
     }
 
-    return chunks;
+    return Buffer.concat(chunks, totalBytes);
   }
 
   private getRequiredField(fields: Record<string, MultipartField>, key: string) {
@@ -104,22 +147,105 @@ export class ImportsController {
   private getOptionalField(fields: Record<string, MultipartField>, key: string) {
     const value = fields[key]?.value;
 
-    return typeof value === 'string' && value.length > 0 ? value : undefined;
+    return typeof value === 'string' && value.trim().length > 0
+      ? value.trim()
+      : undefined;
   }
 
-  private getBooleanField(fields: Record<string, MultipartField>, key: string) {
-    return this.getOptionalField(fields, key) === 'true';
+  private getBooleanField(
+    fields: Record<string, MultipartField>,
+    key: string,
+    defaultValue = false,
+  ) {
+    const value = this.getOptionalField(fields, key);
+
+    if (value === undefined) {
+      return defaultValue;
+    }
+
+    if (value === 'true') {
+      return true;
+    }
+
+    if (value === 'false') {
+      return false;
+    }
+
+    throw new BadRequestException(`${key} must be true or false`);
   }
 
-  private parseMapping(mapping?: string) {
+  private getIntegerField(
+    fields: Record<string, MultipartField>,
+    key: string,
+  ) {
+    const value = this.getOptionalField(fields, key);
+
+    if (value === undefined) {
+      return undefined;
+    }
+
+    const parsed = Number(value);
+
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new BadRequestException(`${key} must be a positive integer`);
+    }
+
+    return parsed;
+  }
+
+  private getParserOptions(
+    fields: Record<string, MultipartField>,
+  ): ImportFileParserOptions {
+    return {
+      sheetName: this.getOptionalField(fields, 'sheetName'),
+      headerRow: this.getIntegerField(fields, 'headerRow'),
+      dataStartRow: this.getIntegerField(fields, 'dataStartRow'),
+    };
+  }
+
+  private getDuplicateStrategy(
+    fields: Record<string, MultipartField>,
+  ): ImportDuplicateStrategy {
+    const value = this.getOptionalField(fields, 'duplicateStrategy') ?? 'SKIP';
+
+    if (value === 'SKIP' || value === 'FAIL' || value === 'UPDATE_EXISTING') {
+      return value;
+    }
+
+    throw new BadRequestException('Invalid duplicateStrategy');
+  }
+
+  private getRegistrationSource(fields: Record<string, MultipartField>) {
+    const value =
+      this.getOptionalField(fields, 'source') ??
+      RegistrationSource.EXCEL_IMPORT;
+
+    if (!Object.values(RegistrationSource).includes(value as RegistrationSource)) {
+      throw new BadRequestException('Invalid registration source');
+    }
+
+    return value as RegistrationSource;
+  }
+
+  private parseMapping(mapping?: string): ImportMapping | undefined {
     if (!mapping) {
       return undefined;
     }
 
     try {
-      return JSON.parse(mapping);
+      const parsed = JSON.parse(mapping) as unknown;
+
+      if (
+        typeof parsed !== 'object' ||
+        parsed === null ||
+        Array.isArray(parsed)
+      ) {
+        throw new Error('Mapping must be an object');
+      }
+
+      return parsed as ImportMapping;
     } catch {
-      throw new BadRequestException('mapping must be valid JSON');
+      throw new BadRequestException('mapping must be valid JSON object');
     }
   }
 }

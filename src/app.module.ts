@@ -10,6 +10,7 @@ import { AuthModule } from './modules/auth/auth.module';
 import { BadgeTemplatesModule } from './modules/badge-templates/badge-templates.module';
 import { CheckpointsModule } from './modules/checkpoints/checkpoints.module';
 import { ClientsModule } from './modules/clients/clients.module';
+import { ClientDashboardModule } from './modules/client-dashboard/client-dashboard.module';
 import { DevicesModule } from './modules/devices/devices.module';
 import { DigitalTicketTemplatesModule } from './modules/digital-ticket-templates/digital-ticket-templates.module';
 import { DigitalTicketsModule } from './modules/digital-tickets/digital-tickets.module';
@@ -51,6 +52,7 @@ import { ZonesModule } from './modules/zones/zones.module';
     AuthModule,
     BadgeTemplatesModule,
     ClientsModule,
+    ClientDashboardModule,
     EventsModule,
     DevicesModule,
     DigitalTicketTemplatesModule,

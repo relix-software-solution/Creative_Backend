@@ -284,13 +284,42 @@ export class QrService {
   }
 
   private formatQrToken(qrToken: QrTokenWithPayload) {
+    const signedQrToken = createSignedQrToken(
+      qrToken.payload,
+      this.signingSecret,
+    );
+
+    const compactQrToken = createCompactQrToken(
+      qrToken.tokenId,
+      this.signingSecret,
+    );
+
     return {
-      qrToken: createSignedQrToken(qrToken.payload, this.signingSecret),
-      compactQrToken: createCompactQrToken(qrToken.tokenId, this.signingSecret),
+      /*
+       * هذا هو الرمز الأساسي المستخدم:
+       * - بالطباعة
+       * - بصور QR
+       * - بصفحة الستاف
+       *
+       * وهو خفيف ويُقرأ بسهولة بحجم 25mm.
+       */
+      qrToken: compactQrToken,
+
+      compactQrToken,
+
+      /*
+       * نحافظ على الرمز القديم الطويل للتوافق
+       * مع أي تكامل يحتاج Full Signed QR.
+       */
+      signedQrToken,
+
       payload: qrToken.payload,
+
       validFrom: qrToken.validFrom,
       validUntil: qrToken.validUntil,
+
       status: qrToken.status,
+
       revokedAt: qrToken.revokedAt,
       generatedAt: qrToken.generatedAt,
     };

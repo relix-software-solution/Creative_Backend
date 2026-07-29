@@ -14,6 +14,7 @@ import {
   EventStatus,
   MovementResult,
   MovementType,
+  OfflineRegistrationMappingStatus,
   OfflineScanOperation,
   OfflineScanOperationStatus,
   Prisma,
@@ -666,25 +667,54 @@ export class ScansService {
   }
 
   private async validateQrForScan(qrRaw: string, eventId: string) {
+    const normalizedQr = qrRaw.trim();
+
+    if (!normalizedQr) {
+      return {
+        valid: false as const,
+        reason: 'INVALID_SIGNATURE',
+        payload: null,
+      };
+    }
+
+    /*
+     * QR المختصر الناتج عن تسجيل Staff Offline.
+     *
+     * شكله:
+     * O2.xxxxxxxxxxxxxxxxxxxxxx
+     */
+    if (normalizedQr.startsWith('O2.')) {
+      return this.validateOfflineReferenceQrForScan(normalizedQr, eventId);
+    }
+
     let payload: Record<string, unknown>;
 
     const qrSigningSecret =
       this.configService.getOrThrow<string>('QR_SIGNING_SECRET');
 
+    /*
+     * أولًا نحاول قراءة Full Signed QR القديم.
+     */
     try {
       payload = verifySignedQrToken(
-        qrRaw,
+        normalizedQr,
         qrSigningSecret,
       ) as unknown as Record<string, unknown>;
     } catch {
+      /*
+       * ثم نحاول قراءة Compact QR الرسمي.
+       */
       try {
         payload = verifyCompactQrToken(
-          qrRaw,
+          normalizedQr,
           qrSigningSecret,
         ) as unknown as Record<string, unknown>;
       } catch {
+        /*
+         * ثم نحاول قراءة Signed Offline QR القديم.
+         */
         try {
-          return await this.validateOfflineQrForScan(qrRaw, eventId);
+          return await this.validateOfflineQrForScan(normalizedQr, eventId);
         } catch {
           return {
             valid: false as const,
@@ -696,13 +726,30 @@ export class ScansService {
     }
 
     const tokenId = typeof payload.tokenId === 'string' ? payload.tokenId : '';
+
+    if (!tokenId) {
+      return {
+        valid: false as const,
+        reason: 'INVALID_SIGNATURE',
+        payload,
+      };
+    }
+
     const storedQrToken = await this.prisma.qrToken.findUnique({
-      where: { tokenId },
+      where: {
+        tokenId,
+      },
+
       include: {
         registration: {
           include: {
             attendeeType: {
-              select: { id: true, code: true, nameAr: true, nameEn: true },
+              select: {
+                id: true,
+                code: true,
+                nameAr: true,
+                nameEn: true,
+              },
             },
           },
         },
@@ -710,7 +757,11 @@ export class ScansService {
     });
 
     if (!storedQrToken) {
-      return { valid: false as const, reason: 'TOKEN_NOT_FOUND', payload };
+      return {
+        valid: false as const,
+        reason: 'TOKEN_NOT_FOUND',
+        payload,
+      };
     }
 
     if (
@@ -739,6 +790,7 @@ export class ScansService {
     }
 
     const now = new Date();
+
     if (
       storedQrToken.status === QrTokenStatus.EXPIRED ||
       now < storedQrToken.validFrom ||
@@ -765,9 +817,187 @@ export class ScansService {
 
     return {
       valid: true as const,
+
       qrToken: storedQrToken,
+
       registration: storedQrToken.registration,
+
       payload,
+    };
+  }
+
+  private async validateOfflineReferenceQrForScan(
+    offlineQrToken: string,
+    eventId: string,
+  ): Promise<
+    | {
+        valid: false;
+        reason: string;
+        payload: Record<string, unknown> | null;
+        qrTokenId?: string;
+        registrationId?: string;
+      }
+    | {
+        valid: true;
+        qrToken: ValidQrContext['qrToken'];
+        registration: ValidQrContext['registration'];
+        payload: Record<string, unknown>;
+      }
+  > {
+    const normalizedToken = offlineQrToken.trim();
+
+    const payload: Record<string, unknown> = {
+      inputType: 'OFFLINE_REFERENCE',
+      offlineQrToken: normalizedToken,
+    };
+
+    /*
+     * offlineQrToken معرف فريد داخل:
+     * OfflineRegistrationMapping
+     */
+    const mapping = await this.prisma.offlineRegistrationMapping.findUnique({
+      where: {
+        offlineQrToken: normalizedToken,
+      },
+    });
+
+    /*
+     * الرمز قد يكون مطبوعًا قبل مزامنة التسجيل.
+     *
+     * في هذه الحالة لا نستطيع قبوله Online حتى تصل
+     * عملية التسجيل الأصلية ويتم إنشاء Mapping.
+     */
+    if (!mapping) {
+      return {
+        valid: false,
+        reason: 'OFFLINE_QR_NOT_SYNCED',
+        payload,
+      };
+    }
+
+    if (mapping.eventId !== eventId) {
+      return {
+        valid: false,
+        reason: 'EVENT_MISMATCH',
+        payload,
+        registrationId: mapping.registrationId ?? undefined,
+      };
+    }
+
+    if (
+      !mapping.registrationId ||
+      mapping.status === OfflineRegistrationMappingStatus.PENDING ||
+      mapping.status === OfflineRegistrationMappingStatus.CONFLICTED ||
+      mapping.status === OfflineRegistrationMappingStatus.REVOKED
+    ) {
+      return {
+        valid: false,
+        reason: 'OFFLINE_QR_NOT_SYNCED',
+        payload,
+        registrationId: mapping.registrationId ?? undefined,
+      };
+    }
+
+    /*
+     * بعد مزامنة التسجيل يجب أن يكون لدينا QR رسمي
+     * مرتبط بالتسجيل القانوني على السيرفر.
+     */
+    const storedQrToken = await this.prisma.qrToken.findFirst({
+      where: {
+        registrationId: mapping.registrationId,
+
+        ...(mapping.canonicalQrTokenId
+          ? {
+              id: mapping.canonicalQrTokenId,
+            }
+          : {}),
+      },
+
+      include: {
+        registration: {
+          include: {
+            attendeeType: {
+              select: {
+                id: true,
+                code: true,
+                nameAr: true,
+                nameEn: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!storedQrToken) {
+      return {
+        valid: false,
+        reason: 'TOKEN_NOT_FOUND',
+        payload,
+        registrationId: mapping.registrationId,
+      };
+    }
+
+    if (storedQrToken.eventId !== eventId) {
+      return {
+        valid: false,
+        reason: 'EVENT_MISMATCH',
+        payload,
+        qrTokenId: storedQrToken.id,
+        registrationId: storedQrToken.registrationId,
+      };
+    }
+
+    if (storedQrToken.status === QrTokenStatus.REVOKED) {
+      return {
+        valid: false,
+        reason: 'TOKEN_REVOKED',
+        payload,
+        qrTokenId: storedQrToken.id,
+        registrationId: storedQrToken.registrationId,
+      };
+    }
+
+    const now = new Date();
+
+    if (
+      storedQrToken.status === QrTokenStatus.EXPIRED ||
+      now < storedQrToken.validFrom ||
+      now > storedQrToken.validUntil
+    ) {
+      return {
+        valid: false,
+        reason: 'TOKEN_EXPIRED',
+        payload,
+        qrTokenId: storedQrToken.id,
+        registrationId: storedQrToken.registrationId,
+      };
+    }
+
+    if (storedQrToken.registration.status !== RegistrationStatus.ACTIVE) {
+      return {
+        valid: false,
+        reason: 'REGISTRATION_INACTIVE',
+        payload,
+        qrTokenId: storedQrToken.id,
+        registrationId: storedQrToken.registrationId,
+      };
+    }
+
+    return {
+      valid: true,
+
+      qrToken: storedQrToken,
+
+      registration: storedQrToken.registration,
+
+      payload: {
+        ...payload,
+
+        canonicalTokenId: storedQrToken.tokenId,
+
+        registrationId: storedQrToken.registrationId,
+      },
     };
   }
 
@@ -1398,10 +1628,21 @@ export class ScansService {
   private toScanDenialReason(reason: string) {
     const reasonMap: Record<string, string> = {
       INVALID_SIGNATURE: 'INVALID_QR',
+
       TOKEN_NOT_FOUND: 'INVALID_QR',
+
+      /*
+       * تسجيل Offline لم يصل إلى السيرفر بعد.
+       */
+      OFFLINE_QR_NOT_SYNCED: 'OFFLINE_REGISTRATION_NOT_SYNCED',
+
       EVENT_MISMATCH: 'WRONG_EVENT',
+
       TOKEN_REVOKED: 'QR_REVOKED',
+
       TOKEN_EXPIRED: 'QR_EXPIRED',
+
+      REGISTRATION_INACTIVE: 'REGISTRATION_INACTIVE',
     };
 
     return reasonMap[reason] ?? reason;
@@ -1541,6 +1782,8 @@ export class ScansService {
       const existingImage =
         await this.qrImageService.getRegistrationQrImageMetadata({
           registrationPublicId: scanEvent.registration.publicId,
+
+          qrToken: qr.qrToken,
         });
       const image =
         existingImage ??
