@@ -5,7 +5,7 @@
 
 */
 -- AlterTable
-ALTER TABLE `client` ADD COLUMN `primaryUserId` VARCHAR(191) NULL;
+ALTER TABLE `Client` ADD COLUMN `primaryUserId` VARCHAR(191) NULL;
 
 -- CreateIndex
 CREATE UNIQUE INDEX `Client_primaryUserId_key` ON `Client`(`primaryUserId`);
