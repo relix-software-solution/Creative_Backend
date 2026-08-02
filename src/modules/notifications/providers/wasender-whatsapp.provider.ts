@@ -54,14 +54,14 @@ export class WasenderWhatsAppProvider implements WhatsAppProvider {
       const classification = this.classifyStatus(response.status);
       throw new WhatsAppProviderError(
         `Wasender request failed with status ${response.status}`,
-        response.status === 429
-          ? 'WHATSAPP_RATE_LIMITED'
-          : classification.code,
+        response.status === 429 ? 'WHATSAPP_RATE_LIMITED' : classification.code,
         {
           ...classification,
           statusCode: response.status,
           retryAfterMs:
-            response.status === 429 ? this.getRetryAfterMs(response) : undefined,
+            response.status === 429
+              ? this.getRetryAfterMs(response)
+              : undefined,
           safeDetails: this.sanitizeRaw(raw),
         },
       );
@@ -125,9 +125,8 @@ export class WasenderWhatsAppProvider implements WhatsAppProvider {
 
     if (reset) {
       const resetNumber = Number(reset);
-      const resetMs = resetNumber > 10_000_000_000
-        ? resetNumber
-        : resetNumber * 1000;
+      const resetMs =
+        resetNumber > 10_000_000_000 ? resetNumber : resetNumber * 1000;
 
       if (!Number.isNaN(resetMs)) {
         return Math.max(resetMs - Date.now(), 0);
@@ -138,15 +137,7 @@ export class WasenderWhatsAppProvider implements WhatsAppProvider {
   }
 
   private classifyStatus(statusCode: number) {
-    if ([400, 401, 403, 404].includes(statusCode)) {
-      return {
-        code: 'WHATSAPP_PERMANENT_FAILURE',
-        permanent: true,
-        retryable: false,
-      };
-    }
-
-    if ([408, 425, 429, 500, 502, 503, 504].includes(statusCode)) {
+    if ([408, 425, 429].includes(statusCode) || statusCode >= 500) {
       return {
         code: 'WHATSAPP_RETRYABLE_FAILURE',
         permanent: false,
@@ -154,10 +145,18 @@ export class WasenderWhatsAppProvider implements WhatsAppProvider {
       };
     }
 
+    if (statusCode >= 400 && statusCode < 500) {
+      return {
+        code: 'WHATSAPP_PERMANENT_FAILURE',
+        permanent: true,
+        retryable: false,
+      };
+    }
+
     return {
-      code: 'WHATSAPP_SEND_FAILED',
-      permanent: false,
-      retryable: true,
+      code: 'WHATSAPP_PERMANENT_FAILURE',
+      permanent: true,
+      retryable: false,
     };
   }
 
@@ -168,7 +167,9 @@ export class WasenderWhatsAppProvider implements WhatsAppProvider {
       (error.name === 'AbortError' || message.toLowerCase().includes('abort'));
 
     return new WhatsAppProviderError(
-      aborted ? 'Wasender request timed out' : 'Wasender network request failed',
+      aborted
+        ? 'Wasender request timed out'
+        : 'Wasender network request failed',
       aborted ? 'WHATSAPP_TIMEOUT' : 'WHATSAPP_NETWORK_ERROR',
       {
         retryable: true,

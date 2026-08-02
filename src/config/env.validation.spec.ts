@@ -15,6 +15,7 @@ describe('envValidationSchema WhatsApp public URL rules', () => {
       WHATSAPP_PROVIDER: 'WASENDER',
       APP_PUBLIC_BASE_URL: 'http://localhost:3000',
       WASENDER_API_KEY: 'secret',
+      WASENDER_WEBHOOK_SECRET: 'webhook-secret',
     });
 
     expect(result.error).toBeDefined();

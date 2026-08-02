@@ -13,12 +13,37 @@ export const envValidationSchema = Joi.object({
   WHATSAPP_PROVIDER: Joi.string()
     .valid('FAKE', 'WASENDER', 'META_CLOUD')
     .default('FAKE'),
-  WHATSAPP_SEND_RATE_PER_SECOND: Joi.number().default(3),
-  WHATSAPP_SEND_MAX_ATTEMPTS: Joi.number().default(5),
-  WHATSAPP_SEND_RETRY_BACKOFF_MS: Joi.number().default(5000),
-  WHATSAPP_SEND_FAILED_ALERT_THRESHOLD: Joi.number().default(10),
-  WHATSAPP_SEND_FAILED_ALERT_WINDOW_MINUTES: Joi.number().default(15),
-  WHATSAPP_HTTP_TIMEOUT_MS: Joi.number().default(15000),
+  WHATSAPP_SEND_RATE_PER_SECOND: Joi.number().positive().max(10).default(0.1),
+
+  WHATSAPP_SEND_MAX_ATTEMPTS: Joi.number().integer().min(1).max(5).default(3),
+
+  WHATSAPP_SEND_RETRY_BACKOFF_MS: Joi.number()
+    .integer()
+    .min(5000)
+    .max(300000)
+    .default(30000),
+
+  WHATSAPP_SEND_FAILED_ALERT_THRESHOLD: Joi.number()
+    .integer()
+    .min(1)
+    .default(10),
+
+  WHATSAPP_SEND_FAILED_ALERT_WINDOW_MINUTES: Joi.number()
+    .integer()
+    .min(1)
+    .default(15),
+
+  WHATSAPP_HTTP_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(5000)
+    .max(60000)
+    .default(15000),
+
+  WHATSAPP_MESSAGE_MAX_AGE_MS: Joi.number()
+    .integer()
+    .min(60000)
+    .max(86400000)
+    .default(900000),
   WHATSAPP_QUEUE_BACKPRESSURE_ENABLED: Joi.boolean().default(true),
   WHATSAPP_QUEUE_MAX_WAITING: Joi.number().default(10000),
   WHATSAPP_QUEUE_RESUME_THRESHOLD: Joi.number().default(5000),
@@ -54,6 +79,26 @@ export const envValidationSchema = Joi.object({
 }).custom((value, helpers) => {
   const provider = value.WHATSAPP_PROVIDER;
 
+  if (provider === 'WASENDER') {
+    if (
+      typeof value.WASENDER_API_KEY !== 'string' ||
+      value.WASENDER_API_KEY.trim().length === 0
+    ) {
+      return helpers.error('any.custom', {
+        message: 'WASENDER_API_KEY is required when using WASENDER',
+      });
+    }
+
+    if (
+      typeof value.WASENDER_WEBHOOK_SECRET !== 'string' ||
+      value.WASENDER_WEBHOOK_SECRET.trim().length === 0
+    ) {
+      return helpers.error('any.custom', {
+        message: 'WASENDER_WEBHOOK_SECRET is required when using WASENDER',
+      });
+    }
+  }
+
   if (provider === 'FAKE') {
     return value;
   }
@@ -80,10 +125,17 @@ export const envValidationSchema = Joi.object({
     });
   }
 
+  if (value.NODE_ENV === 'production' && parsedUrl.protocol !== 'https:') {
+    return helpers.error('any.custom', {
+      message: 'APP_PUBLIC_BASE_URL must use HTTPS in production',
+    });
+  }
+
   const hostname = parsedUrl.hostname.toLowerCase();
   const localHosts = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
   const localAllowed =
-    value.NODE_ENV === 'development' && value.ALLOW_LOCAL_PUBLIC_BASE_URL === true;
+    value.NODE_ENV === 'development' &&
+    value.ALLOW_LOCAL_PUBLIC_BASE_URL === true;
 
   if (localHosts.has(hostname) && !localAllowed) {
     return helpers.error('any.custom', {

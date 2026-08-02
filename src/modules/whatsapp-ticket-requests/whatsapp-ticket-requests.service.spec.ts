@@ -11,7 +11,8 @@ describe('WhatsappTicketRequestsService', () => {
   };
   const image = {
     id: 'ticket-image-1',
-    imageUrl: 'http://localhost:3000/uploads/digital-tickets/generated/ticket.png',
+    imageUrl:
+      'http://localhost:3000/uploads/digital-tickets/generated/ticket.png',
     relativePath: '/uploads/digital-tickets/generated/ticket.png',
   };
 
@@ -40,7 +41,7 @@ describe('WhatsappTicketRequestsService', () => {
     notificationsService = {
       sendRegistrationTicketImage: jest.fn().mockResolvedValue({
         queued: true,
-        jobId: 'whatsapp:notification-1',
+        jobId: 'whatsapp-notification-1',
         log: { id: 'notification-1' },
       }),
     };
@@ -80,9 +81,13 @@ describe('WhatsappTicketRequestsService', () => {
 
   it('prepares an Arabic WhatsApp message containing publicId without the legacy token', async () => {
     const result = await service.createForRegistration(registration.id);
-    const message = decodeURIComponent(new URL(result.url).searchParams.get('text') ?? '');
+    const message = decodeURIComponent(
+      new URL(result.url).searchParams.get('text') ?? '',
+    );
 
-    expect(message).toBe(`\u0637\u0644\u0628 \u0628\u0637\u0627\u0642\u0629 \u0627\u0644\u062f\u062e\u0648\u0644\n${registration.publicId}`);
+    expect(message).toBe(
+      `\u0637\u0644\u0628 \u0628\u0637\u0627\u0642\u0629 \u0627\u0644\u062f\u062e\u0648\u0644\n${registration.publicId}`,
+    );
     expect(message).not.toContain(result.ticketRequestToken);
     expect(message).not.toContain(registration.id);
   });
@@ -90,24 +95,32 @@ describe('WhatsappTicketRequestsService', () => {
   it.each([
     `\u0637\u0644\u0628 \u0628\u0637\u0627\u0642\u0629 \u0627\u0644\u062f\u062e\u0648\u0644\n${registration.publicId}`,
     `Please send ${registration.publicId} - Request entry ticket`,
-  ])('extracts publicId and queues the existing ticket-image notification', async (body) => {
-    await expect(service.handleWasenderWebhook(headers, payload({ body }))).resolves.toMatchObject({
-      queued: true,
-      notificationLogId: 'notification-1',
-    });
+  ])(
+    'extracts publicId and queues the existing ticket-image notification',
+    async (body) => {
+      await expect(
+        service.handleWasenderWebhook(headers, payload({ body })),
+      ).resolves.toMatchObject({
+        queued: true,
+        notificationLogId: 'notification-1',
+      });
 
-    expect(prisma.registration.findUnique).toHaveBeenCalledWith({
-      where: { publicId: registration.publicId },
-    });
-    expect(notificationsService.sendRegistrationTicketImage).toHaveBeenCalledWith({
-      registrationId: registration.id,
-      imageUrl: 'https://api.example.com/uploads/digital-tickets/generated/ticket.png',
-      recipient: '963944777001',
-      dedupeKey: `DIGITAL_TICKET_REQUEST:${registration.id}:provider-message-1`,
-      locale: 'AR',
-      forceResend: false,
-    });
-  });
+      expect(prisma.registration.findUnique).toHaveBeenCalledWith({
+        where: { publicId: registration.publicId },
+      });
+      expect(
+        notificationsService.sendRegistrationTicketImage,
+      ).toHaveBeenCalledWith({
+        registrationId: registration.id,
+        imageUrl:
+          'https://api.example.com/uploads/digital-tickets/generated/ticket.png',
+        recipient: '963944777001',
+        dedupeKey: `DIGITAL_TICKET_REQUEST:${registration.id}:provider-message-1`,
+        locale: 'AR',
+        forceResend: false,
+      });
+    },
+  );
 
   it('rejects a mismatched sender without sending', async () => {
     const result = await service.handleWasenderWebhook(
@@ -116,7 +129,9 @@ describe('WhatsappTicketRequestsService', () => {
     );
 
     expect(result).toEqual({ ignored: true, reason: 'PHONE_MISMATCH' });
-    expect(notificationsService.sendRegistrationTicketImage).not.toHaveBeenCalled();
+    expect(
+      notificationsService.sendRegistrationTicketImage,
+    ).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -124,12 +139,20 @@ describe('WhatsappTicketRequestsService', () => {
     [{ fromMe: true }, 'OUTGOING_MESSAGE'],
     [{ body: 'Request entry ticket' }, 'PUBLIC_ID_NOT_FOUND'],
     [{ event: 'messages.updated' }, 'UNSUPPORTED_EVENT'],
-  ])('acknowledges ignored or invalid messages without sending', async (overrides, reason) => {
-    const result = await service.handleWasenderWebhook(headers, payload(overrides));
+  ])(
+    'acknowledges ignored or invalid messages without sending',
+    async (overrides, reason) => {
+      const result = await service.handleWasenderWebhook(
+        headers,
+        payload(overrides),
+      );
 
-    expect(result).toEqual({ ignored: true, reason });
-    expect(notificationsService.sendRegistrationTicketImage).not.toHaveBeenCalled();
-  });
+      expect(result).toEqual({ ignored: true, reason });
+      expect(
+        notificationsService.sendRegistrationTicketImage,
+      ).not.toHaveBeenCalled();
+    },
+  );
 
   it('deduplicates duplicate provider message deliveries', async () => {
     prisma.webhookDelivery.create.mockRejectedValueOnce(
@@ -139,11 +162,15 @@ describe('WhatsappTicketRequestsService', () => {
       }),
     );
 
-    await expect(service.handleWasenderWebhook(headers, payload())).resolves.toEqual({
+    await expect(
+      service.handleWasenderWebhook(headers, payload()),
+    ).resolves.toEqual({
       ignored: true,
       reason: 'DUPLICATE_WEBHOOK_DELIVERY',
     });
-    expect(notificationsService.sendRegistrationTicketImage).not.toHaveBeenCalled();
+    expect(
+      notificationsService.sendRegistrationTicketImage,
+    ).not.toHaveBeenCalled();
   });
 
   it('allows a distinct later inbound message to request a resend', async () => {
@@ -153,8 +180,12 @@ describe('WhatsappTicketRequestsService', () => {
       payload({ id: 'provider-message-2' }),
     );
 
-    expect(notificationsService.sendRegistrationTicketImage).toHaveBeenCalledTimes(2);
-    expect(notificationsService.sendRegistrationTicketImage).toHaveBeenLastCalledWith(
+    expect(
+      notificationsService.sendRegistrationTicketImage,
+    ).toHaveBeenCalledTimes(2);
+    expect(
+      notificationsService.sendRegistrationTicketImage,
+    ).toHaveBeenLastCalledWith(
       expect.objectContaining({
         dedupeKey: `DIGITAL_TICKET_REQUEST:${registration.id}:provider-message-2`,
       }),
@@ -166,10 +197,14 @@ describe('WhatsappTicketRequestsService', () => {
       new NotFoundException('Active digital ticket template not found'),
     );
 
-    await expect(service.handleWasenderWebhook(headers, payload())).resolves.toEqual({
+    await expect(
+      service.handleWasenderWebhook(headers, payload()),
+    ).resolves.toEqual({
       ignored: true,
       reason: 'DIGITAL_TICKET_TEMPLATE_NOT_FOUND',
     });
-    expect(notificationsService.sendRegistrationTicketImage).not.toHaveBeenCalled();
+    expect(
+      notificationsService.sendRegistrationTicketImage,
+    ).not.toHaveBeenCalled();
   });
 });

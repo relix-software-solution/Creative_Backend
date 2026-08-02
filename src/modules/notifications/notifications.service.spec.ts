@@ -76,7 +76,7 @@ describe('NotificationsService WhatsApp reliability', () => {
     };
     queue = {
       getJob: jest.fn().mockResolvedValue(null),
-      add: jest.fn().mockResolvedValue({ id: 'whatsapp:log_1' }),
+      add: jest.fn().mockResolvedValue({ id: 'whatsapp-log_1' }),
     };
     service = new NotificationsService(
       {
@@ -114,7 +114,10 @@ describe('NotificationsService WhatsApp reliability', () => {
       registrationId: registration.id,
     });
 
-    expect(result).toMatchObject({ skipped: true, reason: 'NOTIFICATION_PENDING' });
+    expect(result).toMatchObject({
+      skipped: true,
+      reason: 'NOTIFICATION_PENDING',
+    });
     expect(prisma.notificationLog.create).not.toHaveBeenCalled();
     expect(queue.add).not.toHaveBeenCalled();
   });
@@ -131,7 +134,10 @@ describe('NotificationsService WhatsApp reliability', () => {
         registrationId: registration.id,
       });
 
-      expect(result).toMatchObject({ skipped: true, reason: `NOTIFICATION_${status}` });
+      expect(result).toMatchObject({
+        skipped: true,
+        reason: `NOTIFICATION_${status}`,
+      });
       expect(queue.add).not.toHaveBeenCalled();
     },
   );
@@ -142,7 +148,7 @@ describe('NotificationsService WhatsApp reliability', () => {
     expect(queue.add).toHaveBeenCalledWith(
       'whatsapp.send',
       { notificationLogId: log.id, manualRetry: false },
-      expect.objectContaining({ jobId: `whatsapp:${log.id}` }),
+      expect.objectContaining({ jobId: `whatsapp-${log.id}` }),
     );
   });
 
@@ -177,7 +183,7 @@ describe('NotificationsService WhatsApp reliability', () => {
     expect(queue.add).toHaveBeenCalledWith(
       'whatsapp.send',
       { notificationLogId: log.id, manualRetry: true },
-      expect.objectContaining({ jobId: `whatsapp:${log.id}` }),
+      expect.objectContaining({ jobId: `whatsapp-${log.id}` }),
     );
   });
 
@@ -217,7 +223,9 @@ describe('NotificationsService WhatsApp reliability', () => {
   });
 
   it('marks final QR image failure as FAILED', async () => {
-    (service as any).qrImageService.generateRegistrationQrImage.mockRejectedValueOnce(
+    (
+      service as any
+    ).qrImageService.generateRegistrationQrImage.mockRejectedValueOnce(
       new Error('disk full'),
     );
     prisma.notificationLog.findUnique.mockResolvedValueOnce({
@@ -245,7 +253,8 @@ describe('NotificationsService WhatsApp reliability', () => {
   it('queues a registration ticket image with existing notification dedupe', async () => {
     const result = await service.sendRegistrationTicketImage({
       registrationId: registration.id,
-      imageUrl: 'https://example.com/uploads/digital-tickets/generated/ticket.png',
+      imageUrl:
+        'https://example.com/uploads/digital-tickets/generated/ticket.png',
     });
 
     expect(result).toMatchObject({ queued: true });
@@ -266,7 +275,8 @@ describe('NotificationsService WhatsApp reliability', () => {
   it('uses the verified webhook sender and per-message ticket request dedupe key', async () => {
     await service.sendRegistrationTicketImage({
       registrationId: registration.id,
-      imageUrl: 'https://example.com/uploads/digital-tickets/generated/ticket.png',
+      imageUrl:
+        'https://example.com/uploads/digital-tickets/generated/ticket.png',
       recipient: '963900000000',
       dedupeKey: 'DIGITAL_TICKET_REQUEST:reg_1:provider-message-1',
     });
@@ -282,7 +292,7 @@ describe('NotificationsService WhatsApp reliability', () => {
     expect(queue.add).toHaveBeenCalledWith(
       'whatsapp.send',
       { notificationLogId: log.id, manualRetry: false },
-      expect.objectContaining({ jobId: `whatsapp:${log.id}` }),
+      expect.objectContaining({ jobId: `whatsapp-${log.id}` }),
     );
   });
 

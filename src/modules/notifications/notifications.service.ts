@@ -175,13 +175,17 @@ export class NotificationsService {
       registration.eventId,
       dto.locale ?? Locale.AR,
     );
-    const content = this.renderTemplate(template?.content, {
-      fullName: registration.fullName,
-      eventTitle: registration.event.titleAr,
-      qrLink: `${this.configService.get<string>('APP_PUBLIC_BASE_URL', 'http://localhost:3000')}/qr/${registration.publicId}`,
-      qrToken: qr.qrToken,
-      registrationPublicId: registration.publicId,
-    }, dto.locale ?? Locale.AR);
+    const content = this.renderTemplate(
+      template?.content,
+      {
+        fullName: registration.fullName,
+        eventTitle: registration.event.titleAr,
+        qrLink: `${this.configService.get<string>('APP_PUBLIC_BASE_URL', 'http://localhost:3000')}/qr/${registration.publicId}`,
+        qrToken: qr.qrToken,
+        registrationPublicId: registration.publicId,
+      },
+      dto.locale ?? Locale.AR,
+    );
     const providerName = this.configService.get<NotificationProvider>(
       'WHATSAPP_PROVIDER',
       NotificationProvider.FAKE,
@@ -235,13 +239,19 @@ export class NotificationsService {
       throw new BadRequestException('Registration must be ACTIVE');
     }
 
-    if (!registration.phone) {
-      throw new BadRequestException('Registration phone is required');
+    const locale = input.locale ?? Locale.AR;
+
+    const recipient = input.recipient?.trim() || registration.phone?.trim();
+
+    if (!recipient) {
+      throw new BadRequestException('WhatsApp recipient phone is required');
     }
 
     this.assertPublicImageUrlCanBeSent(input.imageUrl);
-    const locale = input.locale ?? Locale.AR;
-    const recipient = input.recipient ?? registration.phone;
+
+    if (!recipient) {
+      throw new BadRequestException('WhatsApp recipient phone is required');
+    }
     const dedupeKey =
       input.dedupeKey ??
       this.buildRegistrationQrDedupeKey({
@@ -323,6 +333,7 @@ export class NotificationsService {
     notificationLogId: string;
     attemptNumber: number;
     isFinalAttempt: boolean;
+    manualRetry?: boolean;
   }) {
     try {
       const log = await this.prisma.notificationLog.findUnique({
@@ -349,6 +360,38 @@ export class NotificationsService {
       }
 
       const metadata = this.toMetadata(log.metadata);
+
+      const maxAgeMs = this.configService.get<number>(
+        'WHATSAPP_MESSAGE_MAX_AGE_MS',
+        15 * 60 * 1000,
+      );
+
+      const messageAgeMs = Math.max(Date.now() - log.createdAt.getTime(), 0);
+
+      if (input.manualRetry !== true && messageAgeMs > maxAgeMs) {
+        const cancelledLog = await this.prisma.notificationLog.update({
+          where: { id: log.id },
+          data: {
+            status: NotificationStatus.CANCELLED,
+            failedAt: null,
+            errorCode: 'WHATSAPP_MESSAGE_EXPIRED',
+            errorMessage: 'WhatsApp message expired before delivery',
+            metadata: {
+              ...metadata,
+              expiredAt: new Date().toISOString(),
+              messageAgeMs,
+              maxAgeMs,
+            },
+          },
+        });
+
+        return {
+          skipped: true,
+          reason: 'WHATSAPP_MESSAGE_EXPIRED',
+          log: cancelledLog,
+        };
+      }
+
       await this.prisma.notificationLog.update({
         where: { id: log.id },
         data: {
@@ -392,7 +435,10 @@ export class NotificationsService {
         to: log.recipient,
         message: log.content,
         imageUrl,
-        metadata: { registrationId: log.registration.id, notificationLogId: log.id },
+        metadata: {
+          registrationId: log.registration.id,
+          notificationLogId: log.id,
+        },
       });
       const updatedLog = await this.prisma.notificationLog.update({
         where: { id: log.id },
@@ -527,7 +573,9 @@ export class NotificationsService {
     const log = await this.findLog(id);
 
     if (log.status !== NotificationStatus.FAILED) {
-      throw new BadRequestException('Only FAILED notification logs can be retried');
+      throw new BadRequestException(
+        'Only FAILED notification logs can be retried',
+      );
     }
 
     await this.markLogPendingForRetry(log.id);
@@ -832,7 +880,7 @@ export class NotificationsService {
     const fallback =
       locale === Locale.EN
         ? 'Hello {{fullName}}, your ticket for {{eventTitle}} is attached.'
-        : 'ظ…ط±ط­ط¨ط§ {{fullName}}طŒ طھط°ظƒط±طھظƒ ظ„ظپط¹ط§ظ„ظٹط© {{eventTitle}} ظ…ط±ظپظ‚ط©.';
+        : 'مرحباً {{fullName}}، تذكرتك لفعالية {{eventTitle}} مرفقة.';
     let rendered = content ?? fallback;
 
     for (const [key, value] of Object.entries(variables)) {

@@ -24,7 +24,14 @@ export function getWhatsAppLimiterConfig(
 }
 
 export function getConfiguredWhatsAppRatePerSecond() {
-  const value = Number(process.env.WHATSAPP_SEND_RATE_PER_SECOND ?? 3);
+  const fallbackRate = 0.1;
+  const value = Number(
+    process.env.WHATSAPP_SEND_RATE_PER_SECOND ?? fallbackRate,
+  );
 
-  return Number.isFinite(value) ? value : 3;
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallbackRate;
+  }
+
+  return value;
 }

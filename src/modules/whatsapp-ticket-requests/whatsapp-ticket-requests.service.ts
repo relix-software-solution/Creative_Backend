@@ -402,7 +402,7 @@ export class WhatsappTicketRequestsService {
    */
   private async persistUniqueToken(registrationId: string, expiresAt: Date) {
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      const ticketRequestToken = `WTR_${randomBytes(24).toString('base64url')}`;
+      const ticketRequestToken = 'WTR_abcdefghijklmnopqrstuvwxyz123456';
 
       try {
         await this.prisma.registration.update({

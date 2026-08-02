@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
 import { Job } from 'bullmq';
@@ -10,6 +11,7 @@ import { QUEUE_NAMES } from '../queue.constants';
 
 type WhatsAppNotificationJob = {
   notificationLogId: string;
+  manualRetry?: boolean;
 };
 
 @Processor(QUEUE_NAMES.WHATSAPP_NOTIFICATIONS, {
@@ -23,18 +25,21 @@ export class WhatsAppNotificationProcessor extends WorkerHost {
   ) {
     super();
   }
-
   async process(job: Job<WhatsAppNotificationJob>) {
-    const maxAttempts = this.configService.get<number>(
+    const configuredMaxAttempts = this.configService.get<number>(
       'WHATSAPP_SEND_MAX_ATTEMPTS',
-      5,
+      3,
     );
+
+    const maxAttempts = Number(job.opts.attempts ?? configuredMaxAttempts);
+
     const attemptNumber = job.attemptsMade + 1;
 
     return this.notificationsService.deliverQueuedWhatsApp({
       notificationLogId: job.data.notificationLogId,
       attemptNumber,
       isFinalAttempt: attemptNumber >= maxAttempts,
+      manualRetry: job.data.manualRetry === true,
     });
   }
 }
