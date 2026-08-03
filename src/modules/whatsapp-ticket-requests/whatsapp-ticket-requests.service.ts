@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -36,6 +37,8 @@ type ClaimTicketRequestSenderInput = {
 
 @Injectable()
 export class WhatsappTicketRequestsService {
+  private readonly logger = new Logger(WhatsappTicketRequestsService.name);
+
   /**
    * مثال:
    * REG_237DA5E4E4DC3E43
@@ -45,7 +48,7 @@ export class WhatsappTicketRequestsService {
 
   /**
    * مثال:
-   * WTR_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   * WTR_0ffb7de635f21d8a...
    */
   private readonly ticketRequestTokenPattern =
     /(?:^|[^A-Za-z0-9_-])(WTR_[A-Za-z0-9_-]{20,100})(?![A-Za-z0-9_-])/;
@@ -256,7 +259,7 @@ export class WhatsappTicketRequestsService {
     /**
      * الرقم الذي أرسل رسالة WhatsApp فعليًا.
      *
-     * لم نعد نقارنه مع الرقم الذي أدخله المستخدم
+     * لا نقارنه مع الرقم الذي أدخله المستخدم
      * في نموذج التسجيل.
      */
     const senderPhone = this.normalizePhone(message.senderPhone);
@@ -346,7 +349,10 @@ export class WhatsappTicketRequestsService {
           registrationId: registration.id,
           imageUrl,
           recipient: senderPhone,
-          dedupeKey: `DIGITAL_TICKET_REQUEST:${registration.id}:${message.deliveryId}`,
+          dedupeKey:
+            `DIGITAL_TICKET_REQUEST:` +
+            `${registration.id}:` +
+            `${message.deliveryId}`,
           locale: Locale.AR,
           forceResend: false,
         });
@@ -364,7 +370,7 @@ export class WhatsappTicketRequestsService {
      * نسجل أن الطلب استُخدم بنجاح.
      *
      * لا نحذف الرمز ولا نمنع نفس رقم WhatsApp
-     * من إعادة الطلب، فقد يحتاج إلى المحاولة مجددًا.
+     * من إعادة الطلب.
      */
     await this.prisma.registration.updateMany({
       where: {
@@ -395,14 +401,23 @@ export class WhatsappTicketRequestsService {
   }
 
   /**
-   * ينشئ رمز طلب جديدًا ويحفظه على التسجيل.
+   * ينشئ رمز طلب عشوائيًا وفريدًا ويحفظه على التسجيل.
    *
-   * يتم تصفير رقم WhatsApp المرتبط لأن الرمز الجديد
-   * يمثل عملية طلب جديدة.
+   * الرمز الناتج:
+   * WTR_ + 64 hexadecimal characters
+   *
+   * لا يتم تسجيل الرمز نفسه داخل Logs.
    */
   private async persistUniqueToken(registrationId: string, expiresAt: Date) {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const ticketRequestToken = 'WTR_abcdefghijklmnopqrstuvwxyz123456';
+    const maxAttempts = 5;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const ticketRequestToken = `WTR_${randomBytes(32).toString('hex')}`;
+
+      const tokenFingerprint = createHash('sha256')
+        .update(ticketRequestToken)
+        .digest('hex')
+        .slice(0, 12);
 
       try {
         await this.prisma.registration.update({
@@ -414,7 +429,6 @@ export class WhatsappTicketRequestsService {
             ticketRequestExpiresAt: expiresAt,
             ticketRequestCreatedAt: new Date(),
             ticketRequestConsumedAt: null,
-
             ticketRequestPhone: null,
             ticketRequestClaimedAt: null,
           },
@@ -423,17 +437,141 @@ export class WhatsappTicketRequestsService {
         return ticketRequestToken;
       } catch (error) {
         if (
-          error instanceof Prisma.PrismaClientKnownRequestError &&
-          error.code === 'P2002'
+          !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+          error.code !== 'P2002'
         ) {
-          continue;
+          throw error;
         }
 
-        throw error;
+        const constraint = this.extractPrismaUniqueConstraint(error);
+
+        this.logger.warn(
+          [
+            'Ticket request token unique conflict',
+            `registrationId=${registrationId}`,
+            `attempt=${attempt}`,
+            `constraint=${constraint ?? 'UNKNOWN'}`,
+            `tokenFingerprint=${tokenFingerprint}`,
+          ].join(' '),
+        );
+
+        /**
+         * نعيد المحاولة فقط إذا كان التعارض
+         * على ticketRequestToken.
+         *
+         * إذا كان التعارض على phone أو email
+         * أو أي فهرس آخر، لا نخفي الخطأ.
+         */
+        if (
+          !constraint ||
+          !constraint.toLowerCase().includes('ticketrequesttoken')
+        ) {
+          throw error;
+        }
       }
     }
 
+    this.logger.error(
+      [
+        'Could not generate unique ticket request token',
+        `registrationId=${registrationId}`,
+        `attempts=${maxAttempts}`,
+      ].join(' '),
+    );
+
     throw new BadRequestException('Could not generate ticket request token');
+  }
+
+  /**
+   * يحاول استخراج اسم الـUnique Constraint
+   * من أشكال Prisma وMariaDB المختلفة.
+   */
+  private extractPrismaUniqueConstraint(
+    error: Prisma.PrismaClientKnownRequestError,
+  ): string | undefined {
+    const meta = error.meta as Record<string, unknown> | undefined;
+
+    const target = meta?.target;
+
+    if (typeof target === 'string') {
+      return target;
+    }
+
+    if (Array.isArray(target)) {
+      const fields = target.filter(
+        (value): value is string => typeof value === 'string',
+      );
+
+      if (fields.length > 0) {
+        return fields.join(',');
+      }
+    }
+
+    const driverAdapterError = meta?.driverAdapterError as
+      | Record<string, unknown>
+      | undefined;
+
+    const cause = driverAdapterError?.cause as
+      | Record<string, unknown>
+      | undefined;
+
+    const constraintValue = cause?.constraint;
+
+    if (typeof constraintValue === 'string') {
+      return constraintValue;
+    }
+
+    if (
+      constraintValue &&
+      typeof constraintValue === 'object' &&
+      !Array.isArray(constraintValue)
+    ) {
+      const constraint = constraintValue as Record<string, unknown>;
+
+      if (typeof constraint.index === 'string') {
+        return constraint.index;
+      }
+
+      if (typeof constraint.fields === 'string') {
+        return constraint.fields;
+      }
+
+      if (Array.isArray(constraint.fields)) {
+        const fields = constraint.fields.filter(
+          (value): value is string => typeof value === 'string',
+        );
+
+        if (fields.length > 0) {
+          return fields.join(',');
+        }
+      }
+    }
+
+    const originalMessage = cause?.originalMessage;
+
+    if (typeof originalMessage === 'string') {
+      const constraint = this.extractConstraintFromMessage(originalMessage);
+
+      if (constraint) {
+        return constraint;
+      }
+    }
+
+    return this.extractConstraintFromMessage(error.message);
+  }
+
+  private extractConstraintFromMessage(message: string): string | undefined {
+    const keyMatch = message.match(/for key\s+[`'"]?([^`'"\s]+)[`'"]?/i);
+
+    if (keyMatch?.[1]) {
+      return keyMatch[1];
+    }
+
+    const constraintMatch = message.match(
+      /constraint:?\s+[`'"]?([^`'"\s]+)[`'"]?/i,
+    );
+
+    return constraintMatch?.[1];
   }
 
   /**
@@ -517,7 +655,7 @@ export class WhatsappTicketRequestsService {
 
     /**
      * ربما تم تنفيذ طلبين متزامنين.
-     * نقرأ النتيجة النهائية ونتأكد من الرقم الذي تم ربطه.
+     * نقرأ النتيجة النهائية ونتأكد من الرقم المرتبط.
      */
     const latestRegistration = await this.prisma.registration.findUnique({
       where: {
@@ -578,7 +716,9 @@ export class WhatsappTicketRequestsService {
       `رمز الطلب: ${ticketRequestToken}`,
     ].join('\n');
 
-    return `https://wa.me/${requestPhone}?text=${encodeURIComponent(message)}`;
+    return (
+      `https://wa.me/${requestPhone}` + `?text=${encodeURIComponent(message)}`
+    );
   }
 
   private validateWebhookSecret(
@@ -594,9 +734,6 @@ export class WhatsappTicketRequestsService {
 
     /**
      * Fastify يحول أسماء Headers إلى lowercase.
-     *
-     * Wasender قد يرسل:
-     * X-Webhook-Signature
      */
     const provided =
       this.getHeader(headers, 'x-webhook-signature') ??
@@ -612,15 +749,9 @@ export class WhatsappTicketRequestsService {
   private extractIncomingMessage(
     payload: Record<string, unknown>,
   ): IncomingMessage {
-    /**
-     * Wasender يضع بيانات الرسالة غالبًا داخل:
-     *
-     * data.messages
-     */
     const deliveryId =
       this.firstString(payload, [
         'data.messages.key.id',
-
         'id',
         'messageId',
         'message_id',
@@ -640,7 +771,6 @@ export class WhatsappTicketRequestsService {
         'data.messages.message.imageMessage.caption',
         'data.messages.message.videoMessage.caption',
         'data.messages.message.documentMessage.caption',
-
         'text',
         'body',
         'message',
@@ -654,15 +784,9 @@ export class WhatsappTicketRequestsService {
 
     const senderPhone =
       this.firstString(payload, [
-        /**
-         * cleanedSenderPn هو الخيار الأفضل لأنه رقم هاتف
-         * وليس WhatsApp LID.
-         */
         'data.messages.key.cleanedSenderPn',
         'data.messages.key.senderPn',
-
         'data.messages.key.remoteJid',
-
         'from',
         'sender',
         'senderPhone',
@@ -701,7 +825,6 @@ export class WhatsappTicketRequestsService {
     const outgoing =
       this.firstBoolean(payload, [
         'data.messages.key.fromMe',
-
         'fromMe',
         'isFromMe',
         'outgoing',
@@ -906,6 +1029,7 @@ export class WhatsappTicketRequestsService {
 
   private safeSecretEquals(provided: string, expected: string) {
     const providedBuffer = Buffer.from(provided);
+
     const expectedBuffer = Buffer.from(expected);
 
     return (

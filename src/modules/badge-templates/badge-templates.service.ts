@@ -515,6 +515,7 @@ export class BadgeTemplatesService {
     const image =
       (await this.qrImageService.getRegistrationQrImageMetadata({
         registrationPublicId,
+        qrToken: qr.qrToken,
         requestBaseUrl,
       })) ??
       (await this.qrImageService.generateRegistrationQrImage({

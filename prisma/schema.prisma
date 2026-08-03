@@ -671,6 +671,18 @@ model Registration {
   @@index([eventId, updatedAt, id])
 }
 
+
+model VisitorChange {
+  id             BigInt   @id @default(autoincrement())
+  eventId        String
+  registrationId String
+  operation      String   @db.VarChar(16)
+  changedAt      DateTime @default(now())
+
+  @@index([eventId, id])
+  @@index([eventId, changedAt])
+}
+
 model WebhookDelivery {
   id          String    @id @default(cuid())
   provider    String

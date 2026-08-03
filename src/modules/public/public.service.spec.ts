@@ -59,6 +59,17 @@ function createService() {
       templateVersion: 3,
     }),
   };
+  const qrService = {
+    generate: jest.fn().mockResolvedValue({
+      qrToken: 'Q2.QRT_TEST.compact-signature',
+      compactQrToken: 'Q2.QRT_TEST.compact-signature',
+      signedQrToken: 'signed-payload.signed-signature',
+      status: 'ACTIVE',
+      validFrom: new Date('2026-08-02T08:00:00.000Z'),
+      validUntil: new Date('2026-08-05T20:00:00.000Z'),
+      generatedAt: new Date('2026-08-02T09:00:00.000Z'),
+    }),
+  };
   const whatsappTicketRequestsService = {
     createForRegistration: jest.fn().mockResolvedValue({
       enabled: true,
@@ -75,6 +86,7 @@ function createService() {
     digitalTicketsService as never,
     registrationsService as never,
     whatsappTicketRequestsService as never,
+    qrService as never,
   );
 
   return {
@@ -82,6 +94,7 @@ function createService() {
     digitalTicketsService,
     prisma,
     registration,
+    qrService,
     registrationsService,
     service,
     whatsappTicketRequestsService,
@@ -89,8 +102,9 @@ function createService() {
 }
 
 describe('PublicService Phase 4 registration response', () => {
-  it('returns registration, digitalTicket, and whatsappRequest without QR secrets', async () => {
+  it('returns registration, compact QR, digitalTicket, and whatsappRequest', async () => {
     const {
+      qrService,
       registrationsService,
       service,
       whatsappTicketRequestsService,
@@ -126,14 +140,20 @@ describe('PublicService Phase 4 registration response', () => {
           'https://api.example.com/uploads/digital-tickets/generated/ticket.png',
         pollUrl: null,
       },
+      qr: {
+        qrToken: 'Q2.QRT_TEST.compact-signature',
+        compactQrToken: 'Q2.QRT_TEST.compact-signature',
+        status: 'ACTIVE',
+      },
+      qrToken: 'Q2.QRT_TEST.compact-signature',
       whatsappRequest: {
         enabled: true,
         url: 'https://wa.me/963900000000?text=Request',
       },
     });
-    expect(JSON.stringify(result)).not.toContain('qrToken');
+    expect(qrService.generate).toHaveBeenCalledWith('registration-1');
     expect(JSON.stringify(result)).not.toContain('ticketRequestToken');
-    expect(result.registration).not.toHaveProperty('id');
+    expect(result.registration.id).toBe('registration-1');
   });
 
   it('returns whatsappRequest disabled when request-link creation fails', async () => {

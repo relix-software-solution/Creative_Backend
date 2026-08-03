@@ -292,7 +292,7 @@ export class PublicService {
       qr: {
         qrToken: qr.compactQrToken ?? qr.qrToken,
         compactQrToken: qr.compactQrToken,
-        signedToken: qr.qrToken,
+        signedToken: qr.signedQrToken,
 
         status: qr.status,
         validFrom: qr.validFrom,

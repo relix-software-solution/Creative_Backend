@@ -4,12 +4,13 @@ import { QrModule } from '../qr/qr.module';
 import { RegistrationsModule } from '../registrations/registrations.module';
 import { AdminVisitorsController } from './admin-visitors.controller';
 import { StaffVisitorsController } from './staff-visitors.controller';
+import { VisitorRealtimeService } from './visitor-realtime.service';
 import { VisitorsService } from './visitors.service';
 
 @Module({
   imports: [BadgeTemplatesModule, QrModule, RegistrationsModule],
   controllers: [AdminVisitorsController, StaffVisitorsController],
-  providers: [VisitorsService],
-  exports: [VisitorsService],
+  providers: [VisitorsService, VisitorRealtimeService],
+  exports: [VisitorsService, VisitorRealtimeService],
 })
 export class VisitorsModule {}

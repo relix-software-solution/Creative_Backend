@@ -13,7 +13,7 @@ type GenerateRegistrationQrImageInput = {
 
 type GetRegistrationQrImageMetadataInput = {
   registrationPublicId: string;
-  qrToken?: string;
+  qrToken: string;
   requestBaseUrl?: string;
 };
 
@@ -74,17 +74,7 @@ export class QrImageService {
   async getRegistrationQrImageMetadata(
     input: GetRegistrationQrImageMetadataInput,
   ) {
-    const qrToken = input.qrToken?.trim();
-
-    /*
-     * بعض الاستدعاءات القديمة لا ترسل qrToken.
-     *
-     * عندها لا نستخدم صورة قديمة، بل نرجع null
-     * حتى يتم توليد صورة جديدة من التوكن المختصر.
-     */
-    if (!qrToken) {
-      return null;
-    }
+    const qrToken = input.qrToken.trim();
 
     const filename = this.buildQrFilename(input.registrationPublicId, qrToken);
 

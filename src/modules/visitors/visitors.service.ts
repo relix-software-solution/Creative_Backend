@@ -20,14 +20,16 @@ import {
   ListVisitorsQueryDto,
 } from './dto/list-visitors-query.dto';
 import { StaffOfflineSnapshotQueryDto } from './dto/staff-offline-snapshot-query.dto';
+import { StaffVisitorChangesQueryDto } from './dto/staff-visitor-changes-query.dto';
 import { UpdateStaffVisitorDto } from './dto/update-staff-visitor.dto';
 
 type StaffOfflineSnapshotCursor = {
-  version: 2;
+  version: 2 | 3;
   eventId: string;
   snapshotAsOf: string;
   createdAt: string;
   id: string;
+  changeCursor?: string;
 };
 
 @Injectable()
@@ -45,7 +47,7 @@ export class VisitorsService {
   async getOfflineStateForStaff(userId: string, requestBaseUrl?: string) {
     const assignment = await this.findActiveStaffAssignment(userId);
 
-    const [badgeTemplate, visitorsAggregate] = await Promise.all([
+    const [badgeTemplate, visitorsAggregate, latestChange] = await Promise.all([
       this.badgeTemplatesService.findActiveTemplateOrNull(assignment.eventId),
 
       this.prisma.registration.aggregate({
@@ -61,6 +63,11 @@ export class VisitorsService {
           updatedAt: true,
         },
       }),
+
+      this.prisma.visitorChange.aggregate({
+        where: { eventId: assignment.eventId },
+        _max: { id: true },
+      }),
     ]);
 
     const visitorsCount = visitorsAggregate._count._all;
@@ -69,19 +76,10 @@ export class VisitorsService {
       visitorsAggregate._max.updatedAt?.toISOString() ?? null;
 
     /*
-     * يتغير عند:
-     * - إنشاء زائر.
-     * - تعديل زائر.
-     * - حذف زائر.
-     *
-     * count يكشف الإنشاء والحذف،
-     * updatedAt يكشف التعديلات.
+     * Durable monotonic revision. It changes for create/update/delete and is
+     * safe to use as a delta cursor across reconnects.
      */
-    const visitorsRevision = [
-      assignment.eventId,
-      visitorsCount,
-      visitorsUpdatedAt ?? 'EMPTY',
-    ].join(':');
+    const visitorsRevision = (latestChange._max.id ?? 0n).toString();
 
     const formattedBadgeTemplate = this.formatOfflineBadgeTemplate(
       badgeTemplate,
@@ -158,6 +156,13 @@ export class VisitorsService {
           'Invalid createdAt inside offline snapshot cursor',
         )
       : null;
+
+    const snapshotChangeCursor =
+      decodedCursor?.changeCursor ??
+      (await this.getLatestVisitorChangeCursorAt(
+        assignment.eventId,
+        snapshotAsOf,
+      ));
 
     const cursorWhere: Prisma.RegistrationWhereInput | undefined =
       decodedCursor && cursorCreatedAt
@@ -246,12 +251,6 @@ export class VisitorsService {
               id: true,
               tokenId: true,
 
-              /*
-               * ضروري لإعادة بناء Full Signed QR
-               * بدون استدعاء generate لكل زائر.
-               */
-              payload: true,
-
               status: true,
               validFrom: true,
               validUntil: true,
@@ -293,17 +292,18 @@ export class VisitorsService {
     const nextCursor =
       hasMore && lastItem
         ? this.encodeOfflineSnapshotCursor({
-            version: 2,
+            version: 3,
             eventId: assignment.eventId,
             snapshotAsOf: snapshotAsOf.toISOString(),
             createdAt: lastItem.createdAt.toISOString(),
             id: lastItem.id,
+            changeCursor: snapshotChangeCursor,
           })
         : null;
 
     return {
       snapshot: {
-        version: 2,
+        version: 3,
 
         /*
          * Snapshot ID ثابت لكل صفحات نفس عملية التنزيل.
@@ -315,6 +315,7 @@ export class VisitorsService {
 
         eventId: assignment.eventId,
         snapshotAsOf: snapshotAsOf.toISOString(),
+        changeCursor: snapshotChangeCursor,
 
         pageSize: limit,
         returnedCount: items.length,
@@ -339,42 +340,149 @@ export class VisitorsService {
         requestBaseUrl,
       ),
 
-      visitors: items.map((visitor) => {
-        const qr = this.formatOfflineQr(visitor.qrToken);
+      visitors: items.map((visitor) => this.formatOfflineVisitor(visitor)),
+    };
+  }
+
+
+  async findChangesForStaff(
+    userId: string,
+    query: StaffVisitorChangesQueryDto,
+  ) {
+    const assignment = await this.findActiveStaffAssignment(userId);
+    const after = this.parseVisitorChangeCursor(query.after);
+    const limit = Math.min(Math.max(query.limit || 500, 1), 1000);
+
+    const rows = await this.prisma.visitorChange.findMany({
+      where: {
+        eventId: assignment.eventId,
+        id: { gt: after },
+      },
+      orderBy: { id: 'asc' },
+      take: limit + 1,
+    });
+
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+
+    /*
+     * Registration creation and QR creation can produce two adjacent UPSERT
+     * journal rows. Keep only the newest operation for each registration in
+     * this page while advancing the cursor over every durable journal row.
+     */
+    const latestChangeByRegistration = new Map<
+      string,
+      (typeof pageRows)[number]
+    >();
+
+    for (const change of pageRows) {
+      latestChangeByRegistration.set(change.registrationId, change);
+    }
+
+    const effectiveRows = [...latestChangeByRegistration.values()].sort(
+      (left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    );
+
+    const registrationIds = [
+      ...new Set(
+        effectiveRows
+          .filter((change) => change.operation === 'UPSERT')
+          .map((change) => change.registrationId),
+      ),
+    ];
+
+    const registrations = registrationIds.length
+      ? await this.prisma.registration.findMany({
+          where: {
+            eventId: assignment.eventId,
+            id: { in: registrationIds },
+          },
+          select: {
+            id: true,
+            publicId: true,
+            status: true,
+            source: true,
+            attendeeTypeId: true,
+            fullName: true,
+            phone: true,
+            email: true,
+            companyName: true,
+            jobTitle: true,
+            externalId: true,
+            customFields: true,
+            notes: true,
+            registeredAt: true,
+            syncedAt: true,
+            createdAt: true,
+            updatedAt: true,
+            attendeeType: {
+              select: {
+                id: true,
+                code: true,
+                nameAr: true,
+                nameEn: true,
+              },
+            },
+            qrToken: {
+              select: {
+                id: true,
+                tokenId: true,
+                status: true,
+                validFrom: true,
+                validUntil: true,
+                generatedAt: true,
+                updatedAt: true,
+              },
+            },
+          },
+        })
+      : [];
+
+    const registrationsById = new Map(
+      registrations.map((registration) => [registration.id, registration]),
+    );
+
+    const [latestChange, visitorsCount] = await Promise.all([
+      this.prisma.visitorChange.aggregate({
+        where: { eventId: assignment.eventId },
+        _max: { id: true },
+      }),
+      this.prisma.registration.count({
+        where: { eventId: assignment.eventId },
+      }),
+    ]);
+
+    const nextCursor =
+      pageRows.at(-1)?.id.toString() ?? after.toString();
+    const latestCursor = (latestChange._max.id ?? 0n).toString();
+
+    /*
+     * A change may commit between the page query and the aggregate query.
+     * Keep hasMore=true until the returned cursor actually reaches the latest
+     * durable cursor, preventing a missed realtime registration.
+     */
+    const moreChangesAvailable =
+      hasMore || BigInt(nextCursor) < BigInt(latestCursor);
+
+    return {
+      eventId: assignment.eventId,
+      afterCursor: after.toString(),
+      nextCursor,
+      latestCursor,
+      hasMore: moreChangesAvailable,
+      visitorsCount,
+      changes: effectiveRows.map((change) => {
+        const registration = registrationsById.get(change.registrationId);
 
         return {
-          id: visitor.id,
-          publicId: visitor.publicId,
-
-          status: visitor.status,
-          source: visitor.source,
-
-          attendeeTypeId: visitor.attendeeTypeId,
-          attendeeType: visitor.attendeeType,
-
-          fullName: visitor.fullName,
-          phone: visitor.phone,
-          email: visitor.email,
-
-          companyName: visitor.companyName,
-          jobTitle: visitor.jobTitle,
-          externalId: visitor.externalId,
-
-          customFields: visitor.customFields ?? {},
-          notes: visitor.notes,
-
-          registeredAt: visitor.registeredAt,
-          syncedAt: visitor.syncedAt,
-          createdAt: visitor.createdAt,
-          updatedAt: visitor.updatedAt,
-
-          /*
-           * تسهيل القراءة في الفرونت ودعم النسخ المختلفة.
-           */
-          qrToken: qr?.qrToken ?? null,
-          canonicalQrToken: qr?.qrToken ?? null,
-
-          qr,
+          cursor: change.id.toString(),
+          operation: change.operation,
+          registrationId: change.registrationId,
+          changedAt: change.changedAt.toISOString(),
+          visitor:
+            change.operation === 'UPSERT' && registration
+              ? this.formatOfflineVisitor(registration)
+              : null,
         };
       }),
     };
@@ -383,7 +491,7 @@ export class VisitorsService {
   async findForStaff(
     userId: string,
     query: ListVisitorsQueryDto,
-    requestBaseUrl?: string,
+    _requestBaseUrl?: string,
   ) {
     const assignment = await this.prisma.staffAssignment.findFirst({
       where: {
@@ -406,15 +514,15 @@ export class VisitorsService {
       throw new NotFoundException('No active staff assignment found');
     }
 
-    const badgeTemplate =
-      await this.badgeTemplatesService.findActiveTemplateOrNull(
-        assignment.eventId,
-      );
-
+    /*
+     * Staff search must stay lightweight. It returns the canonical compact QR
+     * already stored in the database and never regenerates QR images or badge
+     * payloads for every search result. Badge preview is assembled locally
+     * from the cached template, while the explicit /:registrationId/qr route
+     * remains available when a registration genuinely has no QR yet.
+     */
     const visitors = await this.findVisitors(query, assignment.eventId, {
       includeQrMetadata: true,
-      badgeTemplate,
-      requestBaseUrl,
     });
 
     return {
@@ -425,6 +533,76 @@ export class VisitorsService {
 
   async findForAdmin(query: ListAdminVisitorsQueryDto) {
     return this.findVisitors(query, query.eventId, true);
+  }
+
+  async generateQrForStaff(
+    userId: string,
+    registrationId: string,
+    requestBaseUrl?: string,
+  ) {
+    const assignment = await this.findActiveStaffAssignment(userId);
+
+    const registration = await this.prisma.registration.findUnique({
+      where: { id: registrationId },
+      select: {
+        id: true,
+        publicId: true,
+        eventId: true,
+        status: true,
+        fullName: true,
+      },
+    });
+
+    if (!registration || registration.eventId !== assignment.eventId) {
+      throw new NotFoundException('Registration not found');
+    }
+
+    const qr = await this.qrService.generate(registration.id);
+
+    const existingImage =
+      await this.qrImageService.getRegistrationQrImageMetadata({
+        registrationPublicId: registration.publicId,
+        qrToken: qr.qrToken,
+        requestBaseUrl,
+      });
+
+    const image =
+      existingImage ??
+      (await this.qrImageService.generateRegistrationQrImage({
+        registrationPublicId: registration.publicId,
+        qrToken: qr.qrToken,
+        requestBaseUrl,
+      }));
+
+    return {
+      registrationId: registration.id,
+      qrToken: qr.qrToken,
+      compactQrToken: qr.compactQrToken,
+      signedToken: qr.signedQrToken,
+      imageUrl: image.publicUrl,
+      publicUrl: image.publicUrl,
+      relativePath: image.relativePath,
+      status: qr.status,
+      validFrom: qr.validFrom,
+      validUntil: qr.validUntil,
+      qr: {
+        qrToken: qr.qrToken,
+        compactQrToken: qr.compactQrToken,
+        signedToken: qr.signedQrToken,
+        imageUrl: image.publicUrl,
+        publicUrl: image.publicUrl,
+        relativePath: image.relativePath,
+        status: qr.status,
+        validFrom: qr.validFrom,
+        validUntil: qr.validUntil,
+      },
+      registration: {
+        id: registration.id,
+        publicId: registration.publicId,
+        fullName: registration.fullName,
+        status: registration.status,
+      },
+    };
   }
 
   async updateForStaff(
@@ -520,12 +698,6 @@ export class VisitorsService {
     const includeQrMetadata =
       typeof options === 'boolean' ? false : options.includeQrMetadata === true;
 
-    const requestBaseUrl =
-      typeof options === 'boolean' ? undefined : options.requestBaseUrl;
-
-    const badgeTemplate =
-      typeof options === 'boolean' ? undefined : options.badgeTemplate;
-
     const { page, limit, skip } = normalizePagination(query);
     const where = this.buildWhere(query, eventId);
 
@@ -605,6 +777,22 @@ export class VisitorsService {
               nameEn: true,
             },
           },
+
+          ...(includeQrMetadata
+            ? {
+                qrToken: {
+                  select: {
+                    id: true,
+                    tokenId: true,
+                    status: true,
+                    validFrom: true,
+                    validUntil: true,
+                    generatedAt: true,
+                    updatedAt: true,
+                  },
+                },
+              }
+            : {}),
         },
       }),
 
@@ -614,13 +802,12 @@ export class VisitorsService {
     ]);
 
     if (includeQrMetadata) {
-      const enrichedItems = await Promise.all(
-        items.map((item) =>
-          this.withQrMetadata(item, requestBaseUrl, badgeTemplate),
-        ),
+      return createPaginatedResponse(
+        items.map((item) => this.formatOfflineVisitor(item)),
+        total,
+        page,
+        limit,
       );
-
-      return createPaginatedResponse(enrichedItems, total, page, limit);
     }
 
     return createPaginatedResponse(items, total, page, limit);
@@ -704,140 +891,6 @@ export class VisitorsService {
           error instanceof Error ? error.message : 'Unknown error'
         }`,
       );
-    }
-  }
-
-  private async withQrMetadata<
-    T extends {
-      id: string;
-      publicId: string;
-      eventId: string;
-      attendeeType: {
-        id: string;
-        code: string;
-        nameAr: string;
-        nameEn: string | null;
-      };
-      fullName: string;
-      phone: string | null;
-      email: string | null;
-      customFields: Prisma.JsonValue;
-      attendeeTypeId: string;
-    },
-  >(
-    visitor: T,
-    requestBaseUrl?: string,
-    badgeTemplate?: EventBadgeTemplate | null,
-  ) {
-    const { eventId, attendeeTypeId, ...publicVisitor } = visitor;
-
-    const qr = await this.resolveQrMetadata(visitor, requestBaseUrl);
-
-    const badge = await this.resolveBadge(
-      visitor,
-      qr,
-      requestBaseUrl,
-      badgeTemplate,
-    );
-
-    return {
-      ...publicVisitor,
-      qr,
-      badge,
-    };
-  }
-
-  private async resolveQrMetadata(
-    visitor: {
-      id: string;
-      publicId: string;
-    },
-    requestBaseUrl?: string,
-  ) {
-    try {
-      const qr = await this.qrService.generate(visitor.id);
-
-      const existingImage =
-        await this.qrImageService.getRegistrationQrImageMetadata({
-          registrationPublicId: visitor.publicId,
-
-          /*
-           * مهم حتى يختار الصورة الخاصة بنفس التوكن.
-           */
-          qrToken: qr.qrToken,
-
-          requestBaseUrl,
-        });
-
-      const image =
-        existingImage ??
-        (await this.qrImageService.generateRegistrationQrImage({
-          registrationPublicId: visitor.publicId,
-          qrToken: qr.qrToken,
-          requestBaseUrl,
-        }));
-
-      return {
-        qrToken: qr.qrToken,
-        imageUrl: image.publicUrl,
-        relativePath: image.relativePath,
-        status: qr.status,
-        validFrom: qr.validFrom,
-        validUntil: qr.validUntil,
-      };
-    } catch (error) {
-      this.logger.warn(
-        `Could not attach QR metadata for registration ${visitor.id}: ${
-          error instanceof Error ? error.message : 'Unknown error'
-        }`,
-      );
-
-      return null;
-    }
-  }
-
-  private async resolveBadge(
-    visitor: {
-      id: string;
-      publicId: string;
-      eventId: string;
-      fullName: string;
-      phone: string | null;
-      email: string | null;
-      customFields: Prisma.JsonValue;
-      attendeeType: {
-        id: string;
-        code: string;
-        nameAr: string;
-        nameEn: string | null;
-      };
-    },
-    qr: {
-      qrToken: string;
-      imageUrl: string;
-      relativePath: string;
-    } | null,
-    requestBaseUrl?: string,
-    badgeTemplate?: EventBadgeTemplate | null,
-  ) {
-    try {
-      return await this.badgeTemplatesService.resolveActiveBadgeForRegistration(
-        {
-          eventId: visitor.eventId,
-          registration: visitor,
-          qr,
-          template: badgeTemplate,
-          requestBaseUrl,
-        },
-      );
-    } catch (error) {
-      this.logger.warn(
-        `Could not attach badge data for registration ${visitor.id}: ${
-          error instanceof Error ? error.message : 'Unknown error'
-        }`,
-      );
-
-      return null;
     }
   }
 
@@ -944,23 +997,26 @@ export class VisitorsService {
       const parsed = JSON.parse(json) as Partial<StaffOfflineSnapshotCursor>;
 
       if (
-        parsed.version !== 2 ||
+        (parsed.version !== 2 && parsed.version !== 3) ||
         typeof parsed.eventId !== 'string' ||
         typeof parsed.snapshotAsOf !== 'string' ||
         typeof parsed.createdAt !== 'string' ||
         typeof parsed.id !== 'string' ||
         parsed.eventId.trim().length === 0 ||
-        parsed.id.trim().length === 0
+        parsed.id.trim().length === 0 ||
+        (parsed.changeCursor !== undefined &&
+          !/^\d+$/.test(parsed.changeCursor))
       ) {
         throw new Error('Invalid cursor structure');
       }
 
       return {
-        version: 2,
+        version: parsed.version,
         eventId: parsed.eventId,
         snapshotAsOf: parsed.snapshotAsOf,
         createdAt: parsed.createdAt,
         id: parsed.id,
+        changeCursor: parsed.changeCursor,
       };
     } catch {
       throw new BadRequestException('Invalid offline snapshot cursor');
@@ -979,19 +1035,73 @@ export class VisitorsService {
 
   private createSnapshotId(eventId: string, snapshotAsOf: string) {
     return this.encodeOfflineSnapshotCursor({
-      version: 2,
+      version: 3,
       eventId,
       snapshotAsOf,
       createdAt: snapshotAsOf,
       id: 'snapshot',
+      changeCursor: '0',
     });
+  }
+
+
+  private parseVisitorChangeCursor(value?: string) {
+    const normalized = value?.trim() || '0';
+
+    if (!/^\d+$/.test(normalized)) {
+      throw new BadRequestException('after must be a non-negative integer');
+    }
+
+    return BigInt(normalized);
+  }
+
+  private async getLatestVisitorChangeCursorAt(
+    eventId: string,
+    snapshotAsOf: Date,
+  ) {
+    const aggregate = await this.prisma.visitorChange.aggregate({
+      where: {
+        eventId,
+        changedAt: { lte: snapshotAsOf },
+      },
+      _max: { id: true },
+    });
+
+    return (aggregate._max.id ?? 0n).toString();
+  }
+
+  private formatOfflineVisitor(visitor: any) {
+    const qr = this.formatOfflineQr(visitor.qrToken);
+
+    return {
+      id: visitor.id,
+      publicId: visitor.publicId,
+      status: visitor.status,
+      source: visitor.source,
+      attendeeTypeId: visitor.attendeeTypeId,
+      attendeeType: visitor.attendeeType,
+      fullName: visitor.fullName,
+      phone: visitor.phone,
+      email: visitor.email,
+      companyName: visitor.companyName,
+      jobTitle: visitor.jobTitle,
+      externalId: visitor.externalId,
+      customFields: visitor.customFields ?? {},
+      notes: visitor.notes,
+      registeredAt: visitor.registeredAt,
+      syncedAt: visitor.syncedAt,
+      createdAt: visitor.createdAt,
+      updatedAt: visitor.updatedAt,
+      qrToken: qr?.qrToken ?? null,
+      canonicalQrToken: qr?.qrToken ?? null,
+      qr,
+    };
   }
 
   private formatOfflineQr(
     qrToken: {
       id: string;
       tokenId: string;
-      payload: Prisma.JsonValue;
       status: string;
       validFrom: Date;
       validUntil: Date;
@@ -1007,21 +1117,6 @@ export class VisitorsService {
       qrToken.tokenId,
     );
 
-    let signedQrToken: string | null = null;
-
-    try {
-      signedQrToken = this.qrService.createSignedTokenForOfflineSnapshot(
-        qrToken.payload,
-        qrToken.tokenId,
-      );
-    } catch (error) {
-      this.logger.warn(
-        `Could not reconstruct signed QR for token ${qrToken.tokenId}: ${
-          error instanceof Error ? error.message : 'Unknown QR payload error'
-        }`,
-      );
-    }
-
     return {
       id: qrToken.id,
       tokenId: qrToken.tokenId,
@@ -1034,10 +1129,10 @@ export class VisitorsService {
       value: compactQrToken,
 
       /*
-       * الاحتفاظ بالرمز الكامل للتوافق والتحقق،
-       * لكنه ليس الرمز المستخدم في صورة QR.
+       * لا نرسل Full Signed QR داخل الـsnapshot لأنه كبير وغير مطلوب
+       * للتحقق؛ Compact Q2 هو الرمز الرسمي المطبوع والممسوح.
        */
-      signedToken: signedQrToken,
+      signedToken: null,
       compactQrToken,
 
       status: qrToken.status,
