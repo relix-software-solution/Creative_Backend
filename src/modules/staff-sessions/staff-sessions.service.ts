@@ -211,12 +211,86 @@ export class StaffSessionsService {
       throw new BadRequestException('Assigned device must be ACTIVE');
     }
 
+    const expectedMode = this.resolveModeForCheckpoint(
+      assignment.checkpoint.type,
+    );
+    const now = new Date();
+
+    /*
+     * بدء الصفحة أو تحديثها لا يجب أن ينهي Session صالحة ثم ينشئ
+     * Session جديدة. هذا السلوك كان يجعل العمليات المخزنة محليًا
+     * تشير إلى Session منتهية ويؤدي إلى:
+     *
+     * Staff session must be ACTIVE
+     *
+     * لذلك نعيد استخدام الجلسة المطابقة نفسها، وننهي فقط الجلسات
+     * الفعالة الزائدة التي لا تطابق التكليف الحالي.
+     */
+    const reusableSession = await this.prisma.staffSession.findFirst({
+      where: {
+        eventId: assignment.eventId,
+        staffUserId: currentUser.id,
+        deviceId: assignment.deviceId,
+        checkpointId: assignment.checkpointId,
+        mode: expectedMode,
+        status: StaffSessionStatus.ACTIVE,
+        endedAt: null,
+      },
+      orderBy: [{ lastSeenAt: 'desc' }, { startedAt: 'desc' }],
+      include: this.staffSessionInclude,
+    });
+
+    if (reusableSession) {
+      const refreshedSession = await this.prisma.$transaction(async (tx) => {
+        await tx.staffSession.updateMany({
+          where: {
+            id: { not: reusableSession.id },
+            status: StaffSessionStatus.ACTIVE,
+            OR: [
+              { staffUserId: currentUser.id },
+              {
+                eventId: assignment.eventId,
+                ...(assignment.deviceId?.trim()
+                  ? { deviceId: assignment.deviceId.trim() }
+                  : {}),
+              },
+            ],
+          },
+          data: {
+            status: StaffSessionStatus.ENDED,
+            endedAt: now,
+          },
+        });
+
+        const session = await tx.staffSession.update({
+          where: { id: reusableSession.id },
+          data: {
+            lastSeenAt: now,
+            metadata: {
+              source: 'START_MY_SESSION_REUSED',
+              assignmentId: assignment.id,
+            } as Prisma.InputJsonValue,
+          },
+          include: this.staffSessionInclude,
+        });
+
+        await tx.device.update({
+          where: { id: assignment.deviceId! },
+          data: { lastSeenAt: now },
+        });
+
+        return session;
+      });
+
+      return this.toSafeSessionResponse(refreshedSession);
+    }
+
     const staffSession = await this.start(currentUser, {
       eventId: assignment.eventId,
       staffUserId: currentUser.id,
       checkpointId: assignment.checkpointId,
       deviceId: assignment.deviceId,
-      mode: this.resolveModeForCheckpoint(assignment.checkpoint.type),
+      mode: expectedMode,
       metadata: {
         source: 'START_MY_SESSION',
         assignmentId: assignment.id,

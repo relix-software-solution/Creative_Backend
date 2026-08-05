@@ -385,16 +385,12 @@ export class StaffAccessService {
         );
       }
 
-      const payloadSessionId = this.getOptionalString(
-        payload,
-        'staffSessionId',
-      );
-
-      if (payloadSessionId && payloadSessionId !== input.staffSessionId) {
-        throw new ForbiddenException(
-          `Offline scan ${input.operation.operationId} targets a different staff session`,
-        );
-      }
+      /*
+       * staffSessionId الموجود داخل Payload يمثل الجلسة الأصلية وقت
+       * المسح وقد تكون انتهت قبل رجوع الإنترنت. صلاحية المزامنة تُؤخذ
+       * من Session الحالية الموجودة على مستوى Batch، مع استمرار التحقق
+       * الصارم من الفعالية والجهاز ونقطة الدخول ونوع الحركة.
+       */
 
       const movementType = this.requirePayloadString(
         payload,

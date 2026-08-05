@@ -68,6 +68,15 @@ type PendingOfflineQrContext = {
   verifiedOfflineQr: VerifiedOfflineQr;
 };
 
+type PendingOfflineReferenceQrContext = {
+  valid: false;
+  pendingOfflineReference: true;
+  reason: 'OFFLINE_QR_NOT_SYNCED';
+  offlineQrToken: string;
+  payload: Record<string, unknown>;
+  registrationId?: string;
+};
+
 @Injectable()
 export class ScansService {
   private readonly logger = new Logger(ScansService.name);
@@ -90,7 +99,21 @@ export class ScansService {
     });
 
     if (existingScan) {
-      if (
+      /*
+       * الإصدارات السابقة كانت تحفظ O2 غير المتزامن كـINVALID_QR.
+       * عند إعادة نفس operationId بعد مزامنة التسجيل يجب إعادة التحقق،
+       * لا إعادة الخطأ القديم إلى الأبد.
+       */
+      const retryableOfflineReference =
+        existingScan.status === ScanEventStatus.INVALID_QR &&
+        existingScan.reason === 'OFFLINE_REGISTRATION_NOT_SYNCED' &&
+        !existingScan.movementLog;
+
+      if (retryableOfflineReference) {
+        await this.prisma.scanEventRaw.delete({
+          where: { id: existingScan.id },
+        });
+      } else if (
         existingScan.status === ScanEventStatus.PROCESSED ||
         existingScan.status === ScanEventStatus.INVALID_QR
       ) {
@@ -104,9 +127,9 @@ export class ScansService {
             generateQrImage: true,
           })),
         };
+      } else {
+        return { duplicate: true, scanEvent: existingScan };
       }
-
-      return { duplicate: true, scanEvent: existingScan };
     }
 
     const event = await this.ensureEventCanBeModified(createScanDto.eventId);
@@ -129,6 +152,32 @@ export class ScansService {
     );
 
     if (!qrContext.valid) {
+      if ('pendingOfflineReference' in qrContext) {
+        const offlineScan =
+          await this.createPendingOfflineReferenceScanFromOnlineScan(
+            createScanDto,
+            scannedAtDevice,
+            qrContext,
+          );
+
+        await this.touchActivity(device.id, staffSession?.id);
+
+        return {
+          allowed: false,
+          provisional: true,
+          pendingReconciliation: true,
+          retryable: true,
+          reason: 'OFFLINE_REGISTRATION_NOT_SYNCED',
+          offlineScanOperationId: offlineScan.id,
+          registration: null,
+          qr: {
+            inputType: 'OFFLINE_REFERENCE',
+            offlineQrToken: qrContext.offlineQrToken,
+            verified: true,
+          },
+        };
+      }
+
       if ('pendingOffline' in qrContext) {
         const offlineScan = await this.createPendingOfflineScanFromOnlineScan(
           createScanDto,
@@ -316,6 +365,55 @@ export class ScansService {
       );
 
       if (!qrContext.valid) {
+        if ('pendingOfflineReference' in qrContext) {
+          if (!scanEvent.checkpointId) {
+            throw new BadRequestException('Offline scans require a checkpoint');
+          }
+
+          await this.createPendingOfflineReferenceScanFromOnlineScan(
+            {
+              operationId: scanEvent.operationId,
+              eventId: scanEvent.eventId,
+              deviceId: scanEvent.deviceId,
+              staffSessionId: scanEvent.staffSessionId ?? undefined,
+              checkpointId: scanEvent.checkpointId,
+              qrToken: scanEvent.qrRaw ?? '',
+              type: scanEvent.type,
+              scannedAtDevice: scanEvent.scannedAtDevice.toISOString(),
+              payload:
+                scanEvent.payload &&
+                typeof scanEvent.payload === 'object' &&
+                !Array.isArray(scanEvent.payload)
+                  ? (scanEvent.payload as Record<string, unknown>)
+                  : undefined,
+            },
+            scanEvent.scannedAtDevice,
+            qrContext,
+          );
+
+          const updatedScanEvent = await this.prisma.scanEventRaw.update({
+            where: { id: scanEvent.id },
+            data: {
+              status: ScanEventStatus.FAILED,
+              result: MovementResult.WARNING,
+              reason: 'OFFLINE_REGISTRATION_NOT_SYNCED',
+              processedAt: new Date(),
+            },
+            include: this.rawScanInclude,
+          });
+
+          await this.touchActivity(device.id, staffSession?.id);
+
+          return {
+            allowed: false,
+            provisional: true,
+            pendingReconciliation: true,
+            retryable: true,
+            reason: 'OFFLINE_REGISTRATION_NOT_SYNCED',
+            scanEvent: updatedScanEvent,
+          };
+        }
+
         if ('pendingOffline' in qrContext) {
           if (!scanEvent.checkpointId) {
             throw new BadRequestException('Offline scans require a checkpoint');
@@ -465,12 +563,20 @@ export class ScansService {
     await this.ensureActiveStaffSession(input.staffSessionId, input.eventId);
     await this.ensureActiveCheckpoint(input.checkpointId, input.eventId);
 
-    const existing = await this.prisma.offlineScanOperation.findUnique({
-      where: { operationId: input.operationId },
-    });
+    const [existing, mapping] = await Promise.all([
+      this.prisma.offlineScanOperation.findUnique({
+        where: { operationId: input.operationId },
+      }),
+      this.prisma.offlineRegistrationMapping.findUnique({
+        where: { offlineQrToken },
+      }),
+    ]);
 
     if (existing) {
-      if (existing.qrPayloadHash !== verified.payloadHash) {
+      if (
+        existing.qrPayloadHash &&
+        existing.qrPayloadHash !== verified.payloadHash
+      ) {
         const conflicted = await this.prisma.offlineScanOperation.update({
           where: { id: existing.id },
           data: {
@@ -484,9 +590,32 @@ export class ScansService {
         return { status: 'CONFLICT', offlineScanOperation: conflicted };
       }
 
-      if (existing.status === OfflineScanOperationStatus.PENDING_LINK) {
+      if (
+        mapping?.registrationId &&
+        existing.status !== OfflineScanOperationStatus.PROCESSED &&
+        existing.status !== OfflineScanOperationStatus.CONFLICTED
+      ) {
+        await this.prisma.offlineScanOperation.update({
+          where: { id: existing.id },
+          data: {
+            status: OfflineScanOperationStatus.LINKED,
+            registrationId: mapping.registrationId,
+            conflictCode: null,
+            conflictMessage: null,
+            staffSessionId: input.staffSessionId ?? existing.staffSessionId,
+          },
+        });
+
+        return this.processOfflineScanOperation(existing.id);
+      }
+
+      if (
+        existing.status === OfflineScanOperationStatus.PENDING_LINK ||
+        existing.status === OfflineScanOperationStatus.FAILED
+      ) {
         return {
           status: OfflineScanOperationStatus.PENDING_LINK,
+          retryable: true,
           offlineScanOperation: existing,
         };
       }
@@ -497,10 +626,6 @@ export class ScansService {
         offlineScanOperation: existing,
       };
     }
-
-    const mapping = await this.prisma.offlineRegistrationMapping.findUnique({
-      where: { offlineQrToken },
-    });
     const offlineScan = await this.prisma.offlineScanOperation.create({
       data: {
         operationId: input.operationId,
@@ -546,7 +671,13 @@ export class ScansService {
     const pendingScans = await this.prisma.offlineScanOperation.findMany({
       where: {
         eventId: input.eventId,
-        status: OfflineScanOperationStatus.PENDING_LINK,
+        status: {
+          in: [
+            OfflineScanOperationStatus.PENDING_LINK,
+            OfflineScanOperationStatus.LINKED,
+            OfflineScanOperationStatus.FAILED,
+          ],
+        },
         OR: [
           { offlineQrToken: input.offlineQrToken },
           {
@@ -830,6 +961,7 @@ export class ScansService {
     offlineQrToken: string,
     eventId: string,
   ): Promise<
+    | PendingOfflineReferenceQrContext
     | {
         valid: false;
         reason: string;
@@ -870,7 +1002,9 @@ export class ScansService {
     if (!mapping) {
       return {
         valid: false,
+        pendingOfflineReference: true,
         reason: 'OFFLINE_QR_NOT_SYNCED',
+        offlineQrToken: normalizedToken,
         payload,
       };
     }
@@ -886,13 +1020,31 @@ export class ScansService {
 
     if (
       !mapping.registrationId ||
-      mapping.status === OfflineRegistrationMappingStatus.PENDING ||
-      mapping.status === OfflineRegistrationMappingStatus.CONFLICTED ||
-      mapping.status === OfflineRegistrationMappingStatus.REVOKED
+      mapping.status === OfflineRegistrationMappingStatus.PENDING
     ) {
       return {
         valid: false,
+        pendingOfflineReference: true,
         reason: 'OFFLINE_QR_NOT_SYNCED',
+        offlineQrToken: normalizedToken,
+        payload,
+        registrationId: mapping.registrationId ?? undefined,
+      };
+    }
+
+    if (mapping.status === OfflineRegistrationMappingStatus.CONFLICTED) {
+      return {
+        valid: false,
+        reason: 'OFFLINE_QR_CONFLICTED',
+        payload,
+        registrationId: mapping.registrationId ?? undefined,
+      };
+    }
+
+    if (mapping.status === OfflineRegistrationMappingStatus.REVOKED) {
+      return {
+        valid: false,
+        reason: 'TOKEN_REVOKED',
         payload,
         registrationId: mapping.registrationId ?? undefined,
       };
@@ -1130,6 +1282,47 @@ export class ScansService {
     };
   }
 
+  private async createPendingOfflineReferenceScanFromOnlineScan(
+    createScanDto: CreateScanDto,
+    scannedAtDevice: Date,
+    context: PendingOfflineReferenceQrContext,
+  ) {
+    if (!createScanDto.checkpointId) {
+      throw new BadRequestException('Offline scans require a checkpoint');
+    }
+
+    const existing = await this.prisma.offlineScanOperation.findUnique({
+      where: { operationId: createScanDto.operationId },
+    });
+
+    if (existing) {
+      return existing;
+    }
+
+    return this.prisma.offlineScanOperation.create({
+      data: {
+        operationId: createScanDto.operationId,
+        eventId: createScanDto.eventId,
+        scannerDeviceId: createScanDto.deviceId,
+        staffSessionId: createScanDto.staffSessionId,
+        checkpointId: createScanDto.checkpointId,
+        offlineQrToken: context.offlineQrToken,
+        scannedAtDevice,
+        movementType: createScanDto.type,
+        localResult:
+          typeof createScanDto.payload?.localResult === 'string'
+            ? createScanDto.payload.localResult
+            : undefined,
+        qrPayload: context.payload as Prisma.InputJsonValue,
+        status: context.registrationId
+          ? OfflineScanOperationStatus.LINKED
+          : OfflineScanOperationStatus.PENDING_LINK,
+        registrationId: context.registrationId,
+        syncedAt: new Date(),
+      },
+    });
+  }
+
   private async createPendingOfflineScanFromOnlineScan(
     createScanDto: CreateScanDto,
     scannedAtDevice: Date,
@@ -1230,10 +1423,12 @@ export class ScansService {
       offlineScan.scannerDeviceId,
       offlineScan.eventId,
     );
-    const staffSession = await this.ensureActiveStaffSession(
-      offlineScan.staffSessionId ?? undefined,
-      offlineScan.eventId,
-    );
+    const staffSession = await this.ensureStaffSessionForOfflineReplay({
+      staffSessionId: offlineScan.staffSessionId ?? undefined,
+      eventId: offlineScan.eventId,
+      deviceId: offlineScan.scannerDeviceId,
+      checkpointId: offlineScan.checkpointId,
+    });
     const checkpoint = await this.ensureActiveCheckpoint(
       offlineScan.checkpointId,
       offlineScan.eventId,
@@ -1250,6 +1445,18 @@ export class ScansService {
     const reason = accessReason ?? reentryReason ?? 'ALLOWED';
     const result =
       reason === 'ALLOWED' ? MovementResult.ALLOWED : MovementResult.DENIED;
+    const storedQrPayload =
+      offlineScan.qrPayload &&
+      typeof offlineScan.qrPayload === 'object' &&
+      !Array.isArray(offlineScan.qrPayload)
+        ? (offlineScan.qrPayload as Record<string, unknown>)
+        : null;
+    const offlineInputType =
+      typeof storedQrPayload?.inputType === 'string'
+        ? storedQrPayload.inputType
+        : offlineScan.qrPayloadHash
+          ? 'OFFLINE_SIGNED'
+          : 'OFFLINE_REFERENCE';
     const scanDto: CreateScanDto = {
       operationId: offlineScan.operationId,
       eventId: offlineScan.eventId,
@@ -1260,7 +1467,7 @@ export class ScansService {
       type: offlineScan.movementType,
       scannedAtDevice: offlineScan.scannedAtDevice.toISOString(),
       payload: {
-        inputType: 'OFFLINE_SIGNED',
+        inputType: offlineInputType,
         localResult: offlineScan.localResult,
       },
     };
@@ -1348,12 +1555,24 @@ export class ScansService {
       throw new BadRequestException('Canonical QR token not found');
     }
 
+    const storedQrPayload =
+      offlineScan.qrPayload &&
+      typeof offlineScan.qrPayload === 'object' &&
+      !Array.isArray(offlineScan.qrPayload)
+        ? (offlineScan.qrPayload as Record<string, unknown>)
+        : {};
+
     return {
       qrToken,
       registration: qrToken.registration,
       payload: {
-        ...(offlineScan.qrPayload as Record<string, unknown> | null),
-        inputType: 'OFFLINE_SIGNED',
+        ...storedQrPayload,
+        inputType:
+          typeof storedQrPayload.inputType === 'string'
+            ? storedQrPayload.inputType
+            : offlineScan.qrPayloadHash
+              ? 'OFFLINE_SIGNED'
+              : 'OFFLINE_REFERENCE',
         canonicalTokenId: qrToken.tokenId,
       },
     };
@@ -1581,6 +1800,49 @@ export class ScansService {
     return staffSession;
   }
 
+  private async ensureStaffSessionForOfflineReplay(input: {
+    staffSessionId: string | undefined;
+    eventId: string;
+    deviceId: string;
+    checkpointId: string;
+  }): Promise<StaffSession | null> {
+    if (!input.staffSessionId) {
+      return null;
+    }
+
+    const staffSession = await this.prisma.staffSession.findUnique({
+      where: { id: input.staffSessionId },
+    });
+
+    if (!staffSession) {
+      /*
+       * Session الأصلية هي معلومة Audit لعملية تمت Offline.
+       * صلاحية رفع العملية تم التحقق منها باستخدام Session الحالية
+       * والجهاز الحالي قبل إنشاء OfflineScanOperation.
+       */
+      return null;
+    }
+
+    if (
+      staffSession.eventId !== input.eventId ||
+      staffSession.deviceId !== input.deviceId ||
+      staffSession.checkpointId !== input.checkpointId
+    ) {
+      throw new BadRequestException(
+        'Offline scan session does not match event, device, or checkpoint',
+      );
+    }
+
+    /*
+     * لا نشترط أن تبقى Session الأصلية ACTIVE عند المصالحة.
+     *
+     * الجهاز قد يعمل Offline لساعات، أو قد تُغلق الجلسة قبل رجوع
+     * الإنترنت. Session الحالية الموثقة هي التي سمحت برفع العملية،
+     * بينما هذه الجلسة تبقى للـaudit وربط النشاط فقط.
+     */
+    return staffSession;
+  }
+
   private async ensureActiveCheckpoint(
     checkpointId: string | undefined,
     eventId: string,
@@ -1635,6 +1897,8 @@ export class ScansService {
        * تسجيل Offline لم يصل إلى السيرفر بعد.
        */
       OFFLINE_QR_NOT_SYNCED: 'OFFLINE_REGISTRATION_NOT_SYNCED',
+
+      OFFLINE_QR_CONFLICTED: 'INVALID_QR',
 
       EVENT_MISMATCH: 'WRONG_EVENT',
 

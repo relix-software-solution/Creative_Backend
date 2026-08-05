@@ -39,6 +39,23 @@ import {
 
 type LocalRegistrationMap = Map<string, { id: string; publicId: string }>;
 
+const NON_RETRYABLE_OFFLINE_OPERATION_CODES = new Set([
+  'DUPLICATE_REGISTRATION',
+  'INVALID_OFFLINE_REGISTRATION',
+  'OFFLINE_REGISTRATION_RESOURCE_NOT_FOUND',
+  'OFFLINE_REGISTRATION_CONFLICT',
+]);
+
+const RETRYABLE_OFFLINE_OPERATION_CODES = new Set([
+  'OPERATION_FAILED',
+  'OFFLINE_REGISTRATION_FAILED',
+  'OFFLINE_REGISTRATION_RETRYABLE_FAILURE',
+  'PREVIOUS_OPERATION_FAILED',
+  'PREVIOUS_OPERATION_NOT_COMPLETED',
+  'OFFLINE_OPERATION_RESULT_MISSING',
+  'CANONICAL_REGISTRATION_ID_MISSING',
+]);
+
 @Injectable()
 export class SyncService {
   constructor(
@@ -230,9 +247,50 @@ export class SyncService {
 
         /**
          * العملية السابقة فشلت.
-         * لا نعرضها كـDuplicate ناجحة.
+         *
+         * في النسخ القديمة كان أي فشل مؤقت يُحفظ نهائيًا، ثم كان
+         * نفس operationId يُرفض إلى الأبد. عمليات التسجيل الأوفلاين
+         * القابلة للاستعادة تُعاد معالجتها هنا بنفس operationId وبنفس
+         * input الأصلي المحفوظ على السيرفر.
          */
         if (existingOperation.status === SyncOperationStatus.FAILED) {
+          if (this.canRetryFailedOfflineOperation(existingOperation)) {
+            const claimed = await this.prisma.syncOperation.updateMany({
+              where: {
+                id: existingOperation.id,
+                status: SyncOperationStatus.FAILED,
+              },
+              data: {
+                status: SyncOperationStatus.PENDING,
+                errorCode: null,
+                errorMessage: null,
+                processedAt: null,
+              },
+            });
+
+            if (claimed.count === 1) {
+              const retryOperationDto: SubmitSyncOperationDto = {
+                operationId: existingOperation.operationId,
+                type: existingOperation.type,
+                payload: this.toRecord(existingOperation.input),
+              };
+
+              const retryResult = await this.processOperation(
+                existingOperation,
+                retryOperationDto,
+                submitSyncBatchDto,
+                localRegistrations,
+              );
+
+              operationResults.push({
+                ...retryResult,
+                retried: true,
+              });
+
+              continue;
+            }
+          }
+
           operationResults.push({
             operationId: operationDto.operationId,
             status: SyncOperationStatus.FAILED,
@@ -241,6 +299,7 @@ export class SyncService {
             errorMessage:
               existingOperation.errorMessage ??
               'The previous operation attempt failed',
+            retryable: this.canRetryFailedOfflineOperation(existingOperation),
           });
 
           continue;
@@ -365,6 +424,7 @@ export class SyncService {
 
         errorCode: classified.code,
         errorMessage: classified.message,
+        retryable: classified.retryable,
       };
     }
   }
@@ -377,6 +437,7 @@ export class SyncService {
         return {
           code: this.getConflictErrorCode(response),
           message: response,
+          retryable: false,
         };
       }
 
@@ -407,12 +468,14 @@ export class SyncService {
         return {
           code,
           message,
+          retryable: false,
         };
       }
 
       return {
         code: 'DUPLICATE_REGISTRATION',
         message: error.message || 'Duplicate registration for this event',
+        retryable: false,
       };
     }
 
@@ -420,6 +483,7 @@ export class SyncService {
       return {
         code: 'INVALID_OFFLINE_REGISTRATION',
         message: this.getHttpExceptionMessage(error),
+        retryable: false,
       };
     }
 
@@ -427,12 +491,14 @@ export class SyncService {
       return {
         code: 'OFFLINE_REGISTRATION_RESOURCE_NOT_FOUND',
         message: this.getHttpExceptionMessage(error),
+        retryable: false,
       };
     }
 
     return {
       code: 'OPERATION_FAILED',
       message: error instanceof Error ? error.message : 'Operation failed',
+      retryable: true,
     };
   }
 
@@ -659,6 +725,101 @@ export class SyncService {
       update: {},
     });
 
+    /**
+     * استعادة عملية انقطعت بعد إنشاء Registration وقبل ربط Mapping.
+     *
+     * كل تسجيل أوفلاين يستخدم operationId كـexternalId، وهو فريد
+     * داخل الفعالية. لذلك يمكننا استعادة التسجيل نفسه دون إنشاء
+     * نسخة ثانية ودون الاعتماد على الهاتف أو البريد.
+     */
+    const operationExternalId =
+      this.getOptionalString(payload, 'externalId') ??
+      offlineRegistrationOperationId;
+
+    const partiallyCreatedRegistration =
+      await this.prisma.registration.findFirst({
+        where: {
+          eventId: batch.eventId,
+          externalId: operationExternalId,
+        },
+      });
+
+    if (partiallyCreatedRegistration) {
+      const recoveredQr = await this.qrService.generate(
+        partiallyCreatedRegistration.id,
+      );
+
+      const recoveredQrToken = await this.prisma.qrToken.findUnique({
+        where: { tokenId: recoveredQr.payload.tokenId },
+      });
+
+      await this.prisma.offlineRegistrationMapping.update({
+        where: { id: mapping.id },
+        data: {
+          registrationId: partiallyCreatedRegistration.id,
+          canonicalQrTokenId: recoveredQrToken?.id,
+          status: OfflineRegistrationMappingStatus.SYNCED,
+          conflictCode: null,
+          conflictMessage: null,
+          syncedAt: new Date(),
+        },
+      });
+
+      localRegistrations.set(offlineRegistrationId, {
+        id: partiallyCreatedRegistration.id,
+        publicId: partiallyCreatedRegistration.publicId,
+      });
+
+      await this.enqueueOfflineReconciliation({
+        eventId: batch.eventId,
+        offlineQrToken,
+        offlineRegistrationOperationId,
+        registrationId: partiallyCreatedRegistration.id,
+      });
+
+      return {
+        status: 'RECOVERED_EXISTING',
+
+        registrationId: partiallyCreatedRegistration.id,
+        publicId: partiallyCreatedRegistration.publicId,
+
+        registration: {
+          id: partiallyCreatedRegistration.id,
+          publicId: partiallyCreatedRegistration.publicId,
+          eventId: partiallyCreatedRegistration.eventId,
+          attendeeTypeId: partiallyCreatedRegistration.attendeeTypeId,
+
+          fullName: partiallyCreatedRegistration.fullName,
+          phone: partiallyCreatedRegistration.phone,
+          email: partiallyCreatedRegistration.email,
+
+          companyName: partiallyCreatedRegistration.companyName,
+          jobTitle: partiallyCreatedRegistration.jobTitle,
+          externalId: partiallyCreatedRegistration.externalId,
+
+          customFields: partiallyCreatedRegistration.customFields ?? {},
+          notes: partiallyCreatedRegistration.notes,
+
+          status: partiallyCreatedRegistration.status,
+          source: partiallyCreatedRegistration.source,
+
+          registeredAt: partiallyCreatedRegistration.registeredAt,
+          createdAt: partiallyCreatedRegistration.createdAt,
+          updatedAt: partiallyCreatedRegistration.updatedAt,
+        },
+
+        offlineRegistrationOperationId,
+        offlineRegistrationId,
+        offlineQrToken,
+        signedOfflineQr,
+
+        canonicalQrTokenId: recoveredQrToken?.id ?? null,
+        canonicalQrToken:
+          recoveredQr.compactQrToken ?? recoveredQr.qrToken,
+        canonicalSignedQrToken: recoveredQr.qrToken,
+      };
+    }
+
     let registration;
     try {
       registration = await this.registrationsService.create({
@@ -675,16 +836,25 @@ export class SyncService {
         source: RegistrationSource.OFFLINE_DEVICE,
       } satisfies CreateRegistrationDto);
     } catch (error) {
+      const permanentFailure =
+        error instanceof ConflictException ||
+        error instanceof BadRequestException ||
+        error instanceof NotFoundException;
+
       await this.prisma.offlineRegistrationMapping.update({
         where: { id: mapping.id },
 
         data: {
-          status: OfflineRegistrationMappingStatus.CONFLICTED,
+          status: permanentFailure
+            ? OfflineRegistrationMappingStatus.CONFLICTED
+            : OfflineRegistrationMappingStatus.PENDING,
 
           conflictCode:
             error instanceof ConflictException
               ? 'DUPLICATE_REGISTRATION'
-              : 'OFFLINE_REGISTRATION_FAILED',
+              : permanentFailure
+                ? 'INVALID_OFFLINE_REGISTRATION'
+                : 'OFFLINE_REGISTRATION_RETRYABLE_FAILURE',
 
           conflictMessage:
             error instanceof Error
@@ -782,9 +952,11 @@ export class SyncService {
       operationId: operationDto.operationId,
       eventId: batch.eventId,
       scannerDeviceId: batch.deviceId,
-      staffSessionId:
-        this.getOptionalString(payload, 'staffSessionId') ??
-        batch.staffSessionId,
+      /*
+       * نستخدم Session الحالية الموثقة على مستوى Batch.
+       * Session المحفوظة داخل العملية تبقى للـaudit فقط وقد تكون منتهية.
+       */
+      staffSessionId: batch.staffSessionId,
       checkpointId: this.getString(payload, 'checkpointId'),
       signedOfflineQr: this.getString(payload, 'signedOfflineQr'),
       offlineQrToken: this.getOptionalString(payload, 'offlineQrToken'),
@@ -974,6 +1146,149 @@ export class SyncService {
     if (staffSession.status !== StaffSessionStatus.ACTIVE) {
       throw new BadRequestException('Staff session must be ACTIVE');
     }
+  }
+
+  private canRetryFailedOfflineOperation(operation: SyncOperation) {
+    if (operation.type !== SyncOperationType.OFFLINE_REGISTRATION) {
+      return false;
+    }
+
+    const errorCode = operation.errorCode?.trim().toUpperCase();
+
+    if (!errorCode) {
+      return true;
+    }
+
+    if (NON_RETRYABLE_OFFLINE_OPERATION_CODES.has(errorCode)) {
+      return false;
+    }
+
+    return (
+      RETRYABLE_OFFLINE_OPERATION_CODES.has(errorCode) ||
+      errorCode.startsWith('HTTP_5') ||
+      errorCode.startsWith('NETWORK_') ||
+      errorCode.startsWith('UNKNOWN_')
+    );
+  }
+
+  private toRecord(value: Prisma.JsonValue): Record<string, unknown> {
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+
+    throw new BadRequestException('Stored sync operation input is invalid');
+  }
+
+  async recoverFailedOfflineRegistrations(input?: {
+    eventId?: string;
+    deviceId?: string;
+    limit?: number;
+    dryRun?: boolean;
+  }) {
+    const limit = Math.min(1000, Math.max(1, input?.limit ?? 250));
+
+    const failedOperations = await this.prisma.syncOperation.findMany({
+      where: {
+        type: SyncOperationType.OFFLINE_REGISTRATION,
+        status: SyncOperationStatus.FAILED,
+        ...(input?.eventId || input?.deviceId
+          ? {
+              syncBatch: {
+                ...(input.eventId ? { eventId: input.eventId } : {}),
+                ...(input.deviceId ? { deviceId: input.deviceId } : {}),
+              },
+            }
+          : {}),
+      },
+      include: {
+        syncBatch: true,
+      },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+    });
+
+    const recoverable = failedOperations.filter((operation) =>
+      this.canRetryFailedOfflineOperation(operation),
+    );
+
+    if (input?.dryRun) {
+      return {
+        dryRun: true,
+        scanned: failedOperations.length,
+        recoverable: recoverable.length,
+        skippedPermanent: failedOperations.length - recoverable.length,
+        operations: recoverable.map((operation) => ({
+          operationId: operation.operationId,
+          eventId: operation.syncBatch.eventId,
+          deviceId: operation.syncBatch.deviceId,
+          errorCode: operation.errorCode,
+          errorMessage: operation.errorMessage,
+        })),
+      };
+    }
+
+    const results: Array<Record<string, unknown>> = [];
+
+    for (const operation of recoverable) {
+      const claimed = await this.prisma.syncOperation.updateMany({
+        where: {
+          id: operation.id,
+          status: SyncOperationStatus.FAILED,
+        },
+        data: {
+          status: SyncOperationStatus.PENDING,
+          errorCode: null,
+          errorMessage: null,
+          processedAt: null,
+        },
+      });
+
+      if (claimed.count !== 1) {
+        results.push({
+          operationId: operation.operationId,
+          status: 'SKIPPED',
+          reason: 'OPERATION_ALREADY_CLAIMED',
+        });
+        continue;
+      }
+
+      const operationDto: SubmitSyncOperationDto = {
+        operationId: operation.operationId,
+        type: operation.type,
+        payload: this.toRecord(operation.input),
+      };
+
+      const batchDto: SubmitSyncBatchDto = {
+        batchId: operation.syncBatch.batchId,
+        eventId: operation.syncBatch.eventId,
+        deviceId: operation.syncBatch.deviceId,
+        staffSessionId: operation.syncBatch.staffSessionId ?? undefined,
+        operations: [operationDto],
+      };
+
+      const result = await this.processOperation(
+        operation,
+        operationDto,
+        batchDto,
+        new Map(),
+      );
+
+      results.push(result);
+    }
+
+    return {
+      dryRun: false,
+      scanned: failedOperations.length,
+      attempted: recoverable.length,
+      processed: results.filter(
+        (result) => result.status === SyncOperationStatus.PROCESSED,
+      ).length,
+      failed: results.filter(
+        (result) => result.status === SyncOperationStatus.FAILED,
+      ).length,
+      skippedPermanent: failedOperations.length - recoverable.length,
+      results,
+    };
   }
 
   private async findDuplicateOperationIds(operationIds: string[]) {

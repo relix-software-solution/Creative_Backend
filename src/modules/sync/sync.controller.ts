@@ -15,6 +15,7 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import type { AuthUser } from '../auth/types/auth-user.type';
 import { StaffAccessService } from '../staff-access/staff-access.service';
 import { ListSyncBatchesQueryDto } from './dto/list-sync-batches-query.dto';
+import { RecoverOfflineRegistrationsDto } from './dto/recover-offline-registrations.dto';
 import { SubmitSyncBatchDto } from './dto/submit-sync-batch.dto';
 import { SyncService } from './sync.service';
 
@@ -38,6 +39,13 @@ export class SyncController {
     );
 
     return this.syncService.submitBatch(submitSyncBatchDto);
+  }
+
+  @Post('recovery/offline-registrations')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN)
+  recoverOfflineRegistrations(@Body() dto: RecoverOfflineRegistrationsDto) {
+    return this.syncService.recoverFailedOfflineRegistrations(dto);
   }
 
   @Get('batches')
