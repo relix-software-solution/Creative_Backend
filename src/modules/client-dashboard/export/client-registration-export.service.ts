@@ -34,6 +34,7 @@ const clientRegistrationExportSelect =
     email: true,
     companyName: true,
     jobTitle: true,
+    customFields: true,
 
     status: true,
     source: true,
@@ -68,6 +69,11 @@ const clientRegistrationExportSelect =
 type ExportRegistration = Prisma.RegistrationGetPayload<{
   select: typeof clientRegistrationExportSelect;
 }>;
+
+type ExportDynamicColumn = {
+  key: string;
+  label: string;
+};
 
 type ExportAttendanceStatus = 'NOT_CHECKED_IN' | 'INSIDE' | 'EXITED';
 
@@ -162,7 +168,12 @@ export class ClientRegistrationExportService {
 
       const orderBy = this.queryService.buildRegistrationOrderBy(query);
 
-      const sheetRows: unknown[][] = [this.getHeaders()];
+      const dynamicColumns = await this.getDynamicColumns(
+        where,
+        query.attendeeTypeId,
+      );
+
+      const sheetRows: unknown[][] = [this.getHeaders(dynamicColumns)];
 
       let offset = 0;
 
@@ -192,7 +203,9 @@ export class ClientRegistrationExportService {
             attendanceMap.get(registration.publicId) ??
             this.createEmptyAttendance();
 
-          sheetRows.push(this.buildSheetRow(registration, attendance));
+          sheetRows.push(
+            this.buildSheetRow(registration, attendance, dynamicColumns),
+          );
         }
 
         offset += registrations.length;
@@ -200,7 +213,7 @@ export class ClientRegistrationExportService {
 
       rowCount = sheetRows.length - 1;
 
-      const buffer = this.createWorkbookBuffer(sheetRows);
+      const buffer = this.createWorkbookBuffer(sheetRows, dynamicColumns);
 
       const filename = this.createFilename();
 
@@ -363,14 +376,66 @@ export class ClientRegistrationExportService {
     };
   }
 
-  private getHeaders(): string[] {
+  private async getDynamicColumns(
+    registrationWhere: Prisma.RegistrationWhereInput,
+    attendeeTypeId?: string,
+  ): Promise<ExportDynamicColumn[]> {
+    const eventRows = await this.prisma.registration.findMany({
+      where: registrationWhere,
+      select: { eventId: true },
+      distinct: ['eventId'],
+    });
+
+    const eventIds = eventRows.map((row) => row.eventId);
+
+    if (eventIds.length === 0) {
+      return [];
+    }
+
+    const fields = await this.prisma.registrationField.findMany({
+      where: {
+        eventId: { in: eventIds },
+        isActive: true,
+        ...(attendeeTypeId
+          ? {
+              OR: [{ attendeeTypeId: null }, { attendeeTypeId }],
+            }
+          : {}),
+      },
+      orderBy: [
+        { eventId: 'asc' },
+        { sortOrder: 'asc' },
+        { createdAt: 'asc' },
+      ],
+      select: {
+        key: true,
+        labelAr: true,
+        labelEn: true,
+      },
+    });
+
+    const columns = new Map<string, ExportDynamicColumn>();
+
+    for (const field of fields) {
+      if (this.isBaseFieldKey(field.key) || columns.has(field.key)) {
+        continue;
+      }
+
+      columns.set(field.key, {
+        key: field.key,
+        label: field.labelAr || field.labelEn || field.key,
+      });
+    }
+
+    return [...columns.values()];
+  }
+
+  private getHeaders(dynamicColumns: ExportDynamicColumn[]): string[] {
     return [
       'رقم التسجيل',
       'الاسم الكامل',
       'رقم الهاتف',
-      'البريد الإلكتروني',
-      'الشركة',
-      'المسمى الوظيفي',
+      ...dynamicColumns.map((column) => column.label),
       'حالة التسجيل',
       'مصدر التسجيل',
       'الفعالية',
@@ -387,6 +452,7 @@ export class ClientRegistrationExportService {
   private buildSheetRow(
     registration: ExportRegistration,
     attendance: ExportAttendanceInfo,
+    dynamicColumns: ExportDynamicColumn[],
   ): string[] {
     const eventTitle =
       registration.event.titleAr || registration.event.titleEn || '';
@@ -405,13 +471,17 @@ export class ClientRegistrationExportService {
       ),
     ).join(', ');
 
+    const dynamicValues = dynamicColumns.map((column) =>
+      this.safeDynamicValue(
+        this.getDynamicFieldValue(registration, column.key),
+      ),
+    );
+
     return [
       this.safe(registration.publicId),
       this.safe(registration.fullName),
       this.safe(registration.phone),
-      this.safe(registration.email),
-      this.safe(registration.companyName),
-      this.safe(registration.jobTitle),
+      ...dynamicValues,
       this.safe(registration.status),
       this.safe(registration.source),
       this.safe(eventTitle),
@@ -425,20 +495,120 @@ export class ClientRegistrationExportService {
     ];
   }
 
+  private normalizeFieldKey(key: string): string {
+    return key.replace(/[\s_-]/g, '').toLowerCase();
+  }
+
+  private isBaseFieldKey(key: string): boolean {
+    const normalizedKey = this.normalizeFieldKey(key);
+
+    return normalizedKey === 'fullname' || normalizedKey === 'phone';
+  }
+
+  private getEquivalentNormalizedKeys(key: string): Set<string> {
+    const normalizedKey = this.normalizeFieldKey(key);
+
+    if (normalizedKey === 'company' || normalizedKey === 'companyname') {
+      return new Set(['company', 'companyname']);
+    }
+
+    if (normalizedKey === 'jobtitle' || normalizedKey === 'position') {
+      return new Set(['jobtitle', 'position']);
+    }
+
+    return new Set([normalizedKey]);
+  }
+
+  private getDynamicFieldValue(
+    registration: ExportRegistration,
+    fieldKey: string,
+  ): unknown {
+    const customFields = this.toRecord(registration.customFields);
+    const exactValue = customFields[fieldKey];
+
+    if (this.hasValue(exactValue)) {
+      return exactValue;
+    }
+
+    const normalizedFieldKey = this.normalizeFieldKey(fieldKey);
+    const equivalentKeys = this.getEquivalentNormalizedKeys(fieldKey);
+    const matchingCustomKey = Object.keys(customFields).find((key) =>
+      equivalentKeys.has(this.normalizeFieldKey(key)),
+    );
+
+    if (matchingCustomKey) {
+      const value = customFields[matchingCustomKey];
+
+      if (this.hasValue(value)) {
+        return value;
+      }
+    }
+
+    if (normalizedFieldKey === 'email') {
+      return registration.email;
+    }
+
+    if (
+      normalizedFieldKey === 'company' ||
+      normalizedFieldKey === 'companyname'
+    ) {
+      return registration.companyName;
+    }
+
+    if (normalizedFieldKey === 'jobtitle' || normalizedFieldKey === 'position') {
+      return registration.jobTitle;
+    }
+
+    return undefined;
+  }
+
+  private toRecord(value: Prisma.JsonValue | null): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return {};
+    }
+
+    return value as Record<string, unknown>;
+  }
+
+  private hasValue(value: unknown): boolean {
+    return value !== undefined && value !== null && value !== '';
+  }
+
+  private safeDynamicValue(value: unknown): string {
+    if (!this.hasValue(value)) {
+      return '';
+    }
+
+    if (typeof value === 'boolean') {
+      return this.safe(value ? 'نعم' : 'لا');
+    }
+
+    if (Array.isArray(value)) {
+      return this.safe(value.map(String).join(', '));
+    }
+
+    if (typeof value === 'object') {
+      return this.safe(JSON.stringify(value));
+    }
+
+    return this.safe(String(value));
+  }
+
   private safe(value: string | null | undefined): string {
     return sanitizeSpreadsheetCell(value);
   }
 
-  private createWorkbookBuffer(rows: unknown[][]): Buffer {
+  private createWorkbookBuffer(
+    rows: unknown[][],
+    dynamicColumns: ExportDynamicColumn[],
+  ): Buffer {
     const worksheet = XLSX.utils.aoa_to_sheet(rows);
 
     worksheet['!cols'] = [
       { wch: 22 },
       { wch: 28 },
       { wch: 20 },
-      { wch: 34 },
-      { wch: 26 },
-      { wch: 24 },
+      ...dynamicColumns.map(() => ({ wch: 24 })),
       { wch: 18 },
       { wch: 18 },
       { wch: 34 },

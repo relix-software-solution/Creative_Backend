@@ -810,7 +810,26 @@ export class RegistrationsService {
 
   private readonly registrationInclude = {
     event: {
-      select: { id: true, titleAr: true, titleEn: true, status: true },
+      select: {
+        id: true,
+        titleAr: true,
+        titleEn: true,
+        status: true,
+        registrationFields: {
+          where: { isActive: true },
+          orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+          select: {
+            id: true,
+            attendeeTypeId: true,
+            key: true,
+            labelAr: true,
+            labelEn: true,
+            type: true,
+            isActive: true,
+            sortOrder: true,
+          },
+        },
+      },
     },
     attendeeType: {
       select: { id: true, code: true, nameAr: true, nameEn: true },

@@ -9,12 +9,14 @@ const clientRegistrationListSelect =
   Prisma.validator<Prisma.RegistrationSelect>()({
     id: true,
     publicId: true,
+    attendeeTypeId: true,
 
     fullName: true,
     phone: true,
     email: true,
     companyName: true,
     jobTitle: true,
+    customFields: true,
 
     status: true,
     source: true,
@@ -64,12 +66,14 @@ const clientRegistrationDetailSelect =
   Prisma.validator<Prisma.RegistrationSelect>()({
     id: true,
     publicId: true,
+    attendeeTypeId: true,
 
     fullName: true,
     phone: true,
     email: true,
     companyName: true,
     jobTitle: true,
+    customFields: true,
 
     status: true,
     source: true,
@@ -91,6 +95,21 @@ const clientRegistrationDetailSelect =
         startsAt: true,
         endsAt: true,
         timezone: true,
+
+        registrationFields: {
+          where: { isActive: true },
+          orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+          select: {
+            id: true,
+            attendeeTypeId: true,
+            key: true,
+            labelAr: true,
+            labelEn: true,
+            type: true,
+            isActive: true,
+            sortOrder: true,
+          },
+        },
 
         venues: {
           select: {
