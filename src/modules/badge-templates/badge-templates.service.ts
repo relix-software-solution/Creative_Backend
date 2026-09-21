@@ -438,6 +438,10 @@ export class BadgeTemplatesService {
         fullName: registration.fullName,
         phone: registration.phone,
         email: registration.email,
+        companyName: registration.companyName,
+        jobTitle: registration.jobTitle,
+        externalId: registration.externalId,
+        customFields: registration.customFields,
         attendeeType: registration.attendeeType,
       },
       qr,
@@ -579,9 +583,25 @@ export class BadgeTemplatesService {
       }
     }
 
-    if (field.source === 'CUSTOM') {
-      return this.toRecord(registration.customFields)[field.key] ?? null;
+    // Custom registration fields override legacy columns regardless of
+    // whether the saved template historically labelled them FIXED or CUSTOM.
+    const customFields = this.toRecord(registration.customFields);
+    const keyNormalized = field.key.replace(/[\s_.:\-/]+/g, '').toLowerCase();
+    const aliases = keyNormalized === 'company' || keyNormalized === 'companyname'
+      ? ['company', 'companyname']
+      : keyNormalized === 'jobtitle' || keyNormalized === 'position'
+        ? ['jobtitle', 'position']
+        : [keyNormalized];
+    const exactValue = customFields[field.key];
+    if (exactValue !== undefined && exactValue !== null && String(exactValue).trim() !== '') {
+      return exactValue;
     }
+    const match = Object.keys(customFields).find((key) =>
+      aliases.includes(key.replace(/[\s_.:\-/]+/g, '').toLowerCase()) &&
+      customFields[key] !== null && customFields[key] !== undefined &&
+      String(customFields[key]).trim() !== '',
+    );
+    if (match) return customFields[match];
 
     const fixedValues: Record<string, unknown> = {
       fullName: registration.fullName,
@@ -596,7 +616,9 @@ export class BadgeTemplatesService {
       'attendeeType.nameEn': registration.attendeeType.nameEn,
     };
 
-    return fixedValues[field.key] ?? null;
+    return fixedValues[field.key] ??
+      (keyNormalized === 'company' ? registration.companyName :
+        keyNormalized === 'position' ? registration.jobTitle : null);
   }
 
   private async ensureEventExists(eventId: string) {
