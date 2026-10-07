@@ -5,6 +5,8 @@ import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { SuccessResponseInterceptor } from './common/interceptors/success-response.interceptor';
 import { envValidationSchema } from './config/env.validation';
 import { PrismaModule } from './database/prisma.module';
+import { AdminDashboardModule } from './modules/admin-dashboard/admin-dashboard.module';
+import { AdminSettingsModule } from './modules/admin-settings/admin-settings.module';
 import { AttendeeTypesModule } from './modules/attendee-types/attendee-types.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { BadgeTemplatesModule } from './modules/badge-templates/badge-templates.module';
@@ -46,6 +48,8 @@ import { ZonesModule } from './modules/zones/zones.module';
       },
     }),
     PrismaModule,
+    AdminDashboardModule,
+    AdminSettingsModule,
     QueueModule,
     HealthModule,
     UsersModule,

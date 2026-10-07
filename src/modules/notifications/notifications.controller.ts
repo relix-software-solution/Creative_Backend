@@ -8,6 +8,7 @@ import { CreateNotificationTemplateDto } from './dto/create-notification-templat
 import { FailedSummaryQueryDto } from './dto/failed-summary-query.dto';
 import { ListNotificationLogsQueryDto } from './dto/list-notification-logs-query.dto';
 import { ListTemplatesQueryDto } from './dto/list-templates-query.dto';
+import { NotificationSummaryQueryDto } from './dto/notification-summary-query.dto';
 import { SendRegistrationQrDto } from './dto/send-registration-qr.dto';
 import { UpdateNotificationTemplateDto } from './dto/update-notification-template.dto';
 import { NotificationsService } from './notifications.service';
@@ -49,6 +50,11 @@ export class NotificationsController {
   @Post('send-registration-qr')
   sendRegistrationQr(@Body() dto: SendRegistrationQrDto) {
     return this.notificationsService.sendRegistrationQr(dto);
+  }
+
+  @Get('summary')
+  summary(@Query() query: NotificationSummaryQueryDto) {
+    return this.notificationsService.summary(query);
   }
 
   @Get('failed-summary')

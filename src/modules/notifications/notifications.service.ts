@@ -21,6 +21,7 @@ import {
   normalizePagination,
 } from '../../common/utils/pagination.util';
 import { PrismaService } from '../../database/prisma.service';
+import { AdminSettingsService } from '../admin-settings/admin-settings.service';
 import { QUEUE_NAMES } from '../queue/queue.constants';
 import { QrImageService } from '../qr/qr-image.service';
 import { QrService } from '../qr/qr.service';
@@ -29,6 +30,7 @@ import { CreateNotificationTemplateDto } from './dto/create-notification-templat
 import { FailedSummaryQueryDto } from './dto/failed-summary-query.dto';
 import { ListNotificationLogsQueryDto } from './dto/list-notification-logs-query.dto';
 import { ListTemplatesQueryDto } from './dto/list-templates-query.dto';
+import { NotificationSummaryQueryDto } from './dto/notification-summary-query.dto';
 import { SendRegistrationQrDto } from './dto/send-registration-qr.dto';
 import { UpdateNotificationTemplateDto } from './dto/update-notification-template.dto';
 import { WhatsAppProviderFactory } from './providers/whatsapp-provider.factory';
@@ -39,6 +41,7 @@ import { Queue } from 'bullmq';
 export class NotificationsService {
   constructor(
     private readonly configService: ConfigService,
+    private readonly adminSettingsService: AdminSettingsService,
     @InjectQueue(QUEUE_NAMES.WHATSAPP_NOTIFICATIONS)
     private readonly whatsappNotificationsQueue: Queue,
     private readonly prisma: PrismaService,
@@ -510,6 +513,27 @@ export class NotificationsService {
         skip,
         take: limit,
         orderBy: { createdAt: 'desc' },
+        include: {
+          event: {
+            select: { id: true, titleAr: true, titleEn: true },
+          },
+          registration: {
+            select: {
+              id: true,
+              publicId: true,
+              fullName: true,
+              phone: true,
+            },
+          },
+          template: {
+            select: {
+              id: true,
+              name: true,
+              type: true,
+              locale: true,
+            },
+          },
+        },
       }),
       this.prisma.notificationLog.count({ where }),
     ]);
@@ -520,6 +544,22 @@ export class NotificationsService {
   async findLog(id: string) {
     const log = await this.prisma.notificationLog.findUnique({
       where: { id },
+      include: {
+        event: {
+          select: { id: true, titleAr: true, titleEn: true },
+        },
+        registration: {
+          select: {
+            id: true,
+            publicId: true,
+            fullName: true,
+            phone: true,
+          },
+        },
+        template: {
+          select: { id: true, name: true, type: true, locale: true },
+        },
+      },
     });
 
     if (!log) {
@@ -527,6 +567,117 @@ export class NotificationsService {
     }
 
     return log;
+  }
+
+  async summary(query: NotificationSummaryQueryDto) {
+    const settings = await this.adminSettingsService.getSettings();
+    const hours = query.hours ?? settings.notificationSummaryHours;
+    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+    const baseWhere: Prisma.NotificationLogWhereInput = query.eventId
+      ? { eventId: query.eventId }
+      : {};
+
+    const [
+      statusCounts,
+      channelCounts,
+      providerCounts,
+      recentCount,
+      recentFailedCount,
+      latestFailure,
+      latestDelivered,
+    ] = await Promise.all([
+      this.prisma.notificationLog.groupBy({
+        by: ['status'],
+        where: baseWhere,
+        _count: { _all: true },
+      }),
+      this.prisma.notificationLog.groupBy({
+        by: ['channel'],
+        where: baseWhere,
+        _count: { _all: true },
+      }),
+      this.prisma.notificationLog.groupBy({
+        by: ['provider'],
+        where: baseWhere,
+        _count: { _all: true },
+      }),
+      this.prisma.notificationLog.count({
+        where: {
+          ...baseWhere,
+          createdAt: { gte: since },
+        },
+      }),
+      this.prisma.notificationLog.count({
+        where: {
+          ...baseWhere,
+          status: NotificationStatus.FAILED,
+          failedAt: { gte: since },
+        },
+      }),
+      this.prisma.notificationLog.findFirst({
+        where: {
+          ...baseWhere,
+          status: NotificationStatus.FAILED,
+        },
+        orderBy: { failedAt: 'desc' },
+        select: { failedAt: true },
+      }),
+      this.prisma.notificationLog.findFirst({
+        where: {
+          ...baseWhere,
+          status: NotificationStatus.DELIVERED,
+        },
+        orderBy: { deliveredAt: 'desc' },
+        select: { deliveredAt: true },
+      }),
+    ]);
+
+    const statusValue = (status: NotificationStatus) =>
+      statusCounts.find((item) => item.status === status)?._count._all ?? 0;
+    const channelValue = (channel: NotificationChannel) =>
+      channelCounts.find((item) => item.channel === channel)?._count._all ?? 0;
+    const providerValue = (provider: NotificationProvider) =>
+      providerCounts.find((item) => item.provider === provider)?._count._all ?? 0;
+
+    const statuses = {
+      pending: statusValue(NotificationStatus.PENDING),
+      sent: statusValue(NotificationStatus.SENT),
+      delivered: statusValue(NotificationStatus.DELIVERED),
+      failed: statusValue(NotificationStatus.FAILED),
+      cancelled: statusValue(NotificationStatus.CANCELLED),
+    };
+    const total = Object.values(statuses).reduce((sum, value) => sum + value, 0);
+    const failedThreshold = settings.notificationAlertThreshold;
+
+    return {
+      total,
+      recentCount,
+      recentFailedCount,
+      windowHours: hours,
+      statuses,
+      channels: {
+        whatsapp: channelValue(NotificationChannel.WHATSAPP),
+        email: channelValue(NotificationChannel.EMAIL),
+        sms: channelValue(NotificationChannel.SMS),
+      },
+      providers: {
+        fake: providerValue(NotificationProvider.FAKE),
+        wasender: providerValue(NotificationProvider.WASENDER),
+        metaCloud: providerValue(NotificationProvider.META_CLOUD),
+      },
+      deliveryRate:
+        total === 0
+          ? 0
+          : Number(((statuses.delivered / total) * 100).toFixed(2)),
+      failureRate:
+        total === 0
+          ? 0
+          : Number(((statuses.failed / total) * 100).toFixed(2)),
+      failedThreshold,
+      alert: recentFailedCount >= failedThreshold,
+      latestFailureAt: latestFailure?.failedAt ?? null,
+      latestDeliveredAt: latestDelivered?.deliveredAt ?? null,
+    };
   }
 
   async failedSummary(query: FailedSummaryQueryDto) {

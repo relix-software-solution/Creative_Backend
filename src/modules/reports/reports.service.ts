@@ -20,8 +20,7 @@ export class ReportsService {
       registrationCounts,
       movementCounts,
       qrCounts,
-      uniqueEntryRows,
-      uniqueExitRows,
+      allowedMovementsForPresence,
     ] = await Promise.all([
       this.prisma.registration.groupBy({
         by: ['status'],
@@ -41,27 +40,37 @@ export class ReportsService {
       this.prisma.movementLog.findMany({
         where: {
           eventId,
-          type: MovementType.ENTRY,
           result: MovementResult.ALLOWED,
         },
-        select: { registrationId: true },
-        distinct: ['registrationId'],
-      }),
-      this.prisma.movementLog.findMany({
-        where: {
-          eventId,
-          type: MovementType.EXIT,
-          result: MovementResult.ALLOWED,
+        select: {
+          registrationId: true,
+          type: true,
+          occurredAt: true,
         },
-        select: { registrationId: true },
-        distinct: ['registrationId'],
+        orderBy: { occurredAt: 'asc' },
       }),
     ]);
     const registrations = this.countByStatus(registrationCounts);
     const movements = this.countMovements(movementCounts);
     const qr = this.countQr(qrCounts);
-    const uniqueCheckedIn = uniqueEntryRows.length;
-    const uniqueExited = uniqueExitRows.length;
+    const uniqueEntryRegistrationIds = new Set<string>();
+    const latestAllowedMovementByRegistration = new Map<string, MovementType>();
+
+    for (const movement of allowedMovementsForPresence) {
+      if (movement.type === MovementType.ENTRY) {
+        uniqueEntryRegistrationIds.add(movement.registrationId);
+      }
+
+      latestAllowedMovementByRegistration.set(
+        movement.registrationId,
+        movement.type,
+      );
+    }
+
+    const uniqueCheckedIn = uniqueEntryRegistrationIds.size;
+    const currentInside = Array.from(
+      latestAllowedMovementByRegistration.values(),
+    ).filter((type) => type === MovementType.ENTRY).length;
     const activeRegistrations = registrations.active;
 
     return {
@@ -77,7 +86,7 @@ export class ReportsService {
       movements,
       attendance: {
         uniqueCheckedIn,
-        currentInsideApprox: Math.max(uniqueCheckedIn - uniqueExited, 0),
+        currentInside,
         attendanceRate:
           activeRegistrations === 0
             ? 0
@@ -299,6 +308,10 @@ export class ReportsService {
     }
 
     return Array.from(byStaff.values());
+  }
+
+  getReportEvent(user: AuthUser, eventId: string) {
+    return this.assertCanViewEvent(user, eventId);
   }
 
   private async assertCanViewEvent(user: AuthUser, eventId: string) {

@@ -1152,3 +1152,17 @@ model AuditLog {
   @@index([entityId])
   @@index([createdAt])
 }
+
+model AdminSetting {
+  id                         String   @id @default("system")
+  organizationName           String   @default("Creative Group For Event Services")
+  timezone                   String   @default("Asia/Damascus")
+  defaultLocale              String   @default("ar")
+  reportExportMaxRows        Int      @default(10000)
+  reportDefaultRangeDays     Int      @default(30)
+  notificationSummaryHours   Int      @default(24)
+  notificationAlertThreshold Int      @default(1)
+  notificationPollingSeconds Int      @default(30)
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+}
