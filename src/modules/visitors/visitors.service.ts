@@ -531,6 +531,59 @@ export class VisitorsService {
     };
   }
 
+  async findOneForStaff(userId: string, registrationId: string) {
+    const assignment = await this.findActiveStaffAssignment(userId);
+
+    const registration = await this.prisma.registration.findUnique({
+      where: { id: registrationId },
+      select: {
+        id: true,
+        publicId: true,
+        eventId: true,
+        status: true,
+        source: true,
+        attendeeTypeId: true,
+        fullName: true,
+        phone: true,
+        email: true,
+        companyName: true,
+        jobTitle: true,
+        externalId: true,
+        customFields: true,
+        notes: true,
+        registeredAt: true,
+        syncedAt: true,
+        createdAt: true,
+        updatedAt: true,
+        attendeeType: {
+          select: {
+            id: true,
+            code: true,
+            nameAr: true,
+            nameEn: true,
+          },
+        },
+        qrToken: {
+          select: {
+            id: true,
+            tokenId: true,
+            status: true,
+            validFrom: true,
+            validUntil: true,
+            generatedAt: true,
+            updatedAt: true,
+          },
+        },
+      },
+    });
+
+    if (!registration || registration.eventId !== assignment.eventId) {
+      throw new NotFoundException('Registration not found');
+    }
+
+    return this.formatOfflineVisitor(registration);
+  }
+
   async findForAdmin(query: ListAdminVisitorsQueryDto) {
     return this.findVisitors(query, query.eventId, true);
   }

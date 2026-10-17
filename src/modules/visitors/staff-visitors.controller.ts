@@ -101,6 +101,15 @@ export class StaffVisitorsController {
     );
   }
 
+  @Get(':registrationId')
+  @Header('Cache-Control', 'no-store, no-cache, must-revalidate')
+  findOneMine(
+    @CurrentUser() user: AuthUser,
+    @Param('registrationId') registrationId: string,
+  ) {
+    return this.visitorsService.findOneForStaff(user.id, registrationId);
+  }
+
   @Post(':registrationId/qr')
   generateQr(
     @CurrentUser() user: AuthUser,
